@@ -43,9 +43,17 @@ df_imp <- missRanger(
 ## -----------------------------------------------------------------------
 ## 3 · ADD MISSINGNESS INDICATORS
 ## -----------------------------------------------------------------------
-na_flags <- df[ , lapply(.SD, function(x) as.integer(is.na(x)))]
-setnames(na_flags, paste0(names(df), "__NA"))
-df_ready <- cbind(df_imp, na_flags)
+
+## keep just the columns with ≥1 missing value
+flag_dt <- df[ , lapply(.SD, function(x)
+  if (anyNA(x)) as.integer(is.na(x))),  # only if needed
+  .SDcols = names(df)]                          # or a subset
+
+if (ncol(flag_dt))                             # rename only if any flags made
+  setnames(flag_dt, paste0(names(flag_dt), "__NA"))
+
+## combine with imputed data
+df_ready <- cbind(df_imp, flag_dt)
 
 ## -----------------------------------------------------------------------
 ## 4 · GBM WEIGHTING  (WeightIt / twang)
@@ -84,15 +92,22 @@ qsave(W, "iptw_weightit_full.qs", preset = "high")
 ## -----------------------------------------------------------------------
 bal_res <- bal.tab(W, un = TRUE, disp.v.ratio = TRUE)
 
-love_plot <- plot(W, type = "balance") +
+## ── 6A · Love plot  ------------------------------------------------------
+love.plot(
+  W,
+  abs        = TRUE,
+  var.order  = "unadjusted",
+  sample.names = c("Unadjusted", "Adjusted")
+) +
   theme_minimal(base_size = 12) +
   ggtitle("Covariate Balance (Love Plot)")
 
-ps_plot <- plot(W, type = "density") +
+## ── 6B · Propensity-score overlap  --------------------------------------
+plot(W, type = "density") +
   theme_minimal(base_size = 12) +
   ggtitle("Propensity Score Overlap")
-
-weight_df <- data.frame(weight = W$weights)
+## ── 6C · Weight distribution  -------------------------------------------
+weight_df   <- data.frame(weight = W$weights)
 weight_plot <- ggplot(weight_df, aes(weight)) +
   geom_histogram(bins = 50, alpha = 0.8) +
   coord_cartesian(xlim = c(0, quantile(weight_df$weight, 0.995))) +
@@ -101,14 +116,18 @@ weight_plot <- ggplot(weight_df, aes(weight)) +
        y = "Count") +
   theme_minimal(base_size = 12)
 
+## ── 6D · Balance table  --------------------------------------------------
 tbl_grob <- tableGrob(
   bal_res$Balance[1:min(25, nrow(bal_res$Balance)), ],
-  rows = NULL, theme = ttheme_minimal(base_size = 10)
+  rows  = NULL,
+  theme = ttheme_minimal(base_size = 10)
 )
 
-row1 <- plot_grid(love_plot, ps_plot, ncol = 2, rel_widths = c(1, 1))
-row2 <- plot_grid(weight_plot, tbl_grob, ncol = 2, rel_widths = c(1, 1.1))
-full_fig <- plot_grid(row1, row2, nrow = 2)
+## ── 6E · Assemble and save PDF  -----------------------------------------
+row1     <- plot_grid(love_plot, ps_plot,  ncol = 2, rel_widths = c(1, 1))
+row2     <- plot_grid(weight_plot, tbl_grob, ncol = 2, rel_widths = c(1, 1.1))
+plot_grid(row1, row2, nrow = 2)
+
 
 pdf("supplementary_iptw_diagnostics.pdf", width = 11, height = 8.5)
 grid::grid.draw(full_fig)

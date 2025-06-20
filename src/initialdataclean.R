@@ -1,214 +1,273 @@
 library(tidyverse)
 library(data.table)
+library(fastDummies)
+
+#TODO
+# - look at TBICEREBRALMONITORHRS and the rest of the NA table to fix it
 
 start <- fread("df.csv")
 
-df <- start %>% 
-  ## recode 2 → 0 for listed binary variables
-  mutate(across(
-    c(SEX, WITHDRAWALLST, TBIMIDLINESHIFT,
-      RESPIRATORYASSISTANCE, SUPPLEMENTALOXYGEN,
-      INTERFACILITYTRANSFER, PREHOSPITALCARDIACARREST,
-      DEATHINED, BLOODMEASURE, ANTIBIOTICTHERAPY),
-    ~ ifelse(.x == 2, 0, .x)
-  )) %>%
-  ## recode respiratory assistance since its backwards
-  mutate(RESPIRATORYASSISTANCE = if_else(RESPIRATORYASSISTANCE == 1, 0, 1)) %>%
-  ## apply cohort filters -
+# MSM Dataset Creation ----------------------------------------------------
+
+# Load necessary libraries
+# ── 1 · Load Raw Data ──────────────────────────────────────────────────────────
+# Using fread for speed with large datasets
+start <- fread("df.csv")
+
+# ── 2 · Initial Cleaning and Filtering ───────────────────────────────────────
+# This block combines your initial data prep steps into one pipeline
+# for clarity and efficiency.
+df_processed <- start %>% 
+  # Recode binary variables (2 -> 0) and flip RESPIRATORYASSISTANCE logic
+  mutate(
+    across(
+      c(SEX, WITHDRAWALLST, TBIMIDLINESHIFT, RESPIRATORYASSISTANCE, 
+        SUPPLEMENTALOXYGEN, INTERFACILITYTRANSFER, PREHOSPITALCARDIACARREST, 
+        ANTIBIOTICTHERAPY),
+      ~ if_else(.x == 2, 0, .x)
+    ),
+    RESPIRATORYASSISTANCE = 1 - RESPIRATORYASSISTANCE # Flips 0 to 1 and 1 to 0
+  ) %>%
+  ## ── A · recode the prophylaxis type ─────────────────────────────
+  mutate(
+    VTEPROPHYLAXISTYPE = dplyr::recode(
+      VTEPROPHYLAXISTYPE,
+      "LWMH"                   = 1L,   # typo “LWMH” fixed here
+      "Unfractionated Heparin" = 2L,
+      "Xa Inhibitor"           = 3L,
+      .default                 = NA_integer_
+    )
+  ) %>% 
+  # Apply cohort filters, now including Xa Inhibitors
+  # Using numeric codes: 6=LMWH, 11=Unfractionated Heparin, 8=Xa Inhibitor
   filter(
     SEX != 3,
     TBIMIDLINESHIFT != 3,
-    VTEPROPHYLAXISTYPE %in% c("LWMH", "Unfractionated Heparin"),
-    VTEPROPHYLAXISHRS < 168
-  ) %>% 
-  ## set reference level for prophylaxis type
-  mutate(
-    VTEPROPHYLAXISTYPE = relevel(factor(VTEPROPHYLAXISTYPE),
-                                 ref = "Unfractionated Heparin")
+    VTEPROPHYLAXISTYPE %in% c(1, 2, 3),
+    VTEPROPHYLAXISHRS < 168 # Less than one week
   ) %>%
-  ## remove variables that are extensively missing
-  select(-EMSNOTIFYHRS, -EMSLEFTHRS, -EMSDepartureHrs, -InpatientHrs,
-         -HOSPITALDISCHARGEHRS, -HIGHESTACTIVATION, -TRAUMASURGEONARRIVALHRS,
-         -inc_key, -V1, -WITHDRAWALLSTHRS, -LOWESTSBP, -ICP_NA, -DEATHINED,
-         -RACE_NA, -TCC_NA, -VPO_NA, -PREHOSPITALCARDIACARREST, -GCSQ_NA,
-         -PMGCSQ_NA, -V1, -inc_key) %>%
-  ## Recoding relevant variable with NAs --> 0
-  ## - Need to add blood variables here?
-  mutate(across(
-    c(
-      "TOTALVENTDAYS", "TOTALICULOS",
-      "HE_UnplannedIntubation", "HE_Stroke.CVA", "HE_SevereSepsis",
-      "HE_DVT", "HE_UnplannedAdmissiontoICU", "HE_UnplannedVisittoOR",
-      "Hx_Pregnancy"
-    ),
-    ~ tidyr::replace_na(.x, 0)
-  )) %>%
-  ## Making everything numeric
-  mutate(across(everything(), ~ suppressWarnings(as.numeric(.x)))) %>%
-  ## Remove Hospital Events before weighting
-  select(-starts_with("HE")) %>%
-  ## Only keeping time variables before VTEPROPHYLAXISHRS
-  mutate(
-    # keep value only if event happened before VTE prophylaxis; otherwise 0
-    ANGIOGRAPHY =
-      if_else(!is.na(ANGIOGRAPHYHRS) & ANGIOGRAPHYHRS < VTEPROPHYLAXISHRS,
-              ANGIOGRAPHY, 0),
-    
-    HMRRHGCTRLSURG =
-      if_else(!is.na(HMRRHGCTRLSURGHRS) & HMRRHGCTRLSURGHRS < VTEPROPHYLAXISHRS,
-              HMRRHGCTRLSURGTYPE, 0),
-    
-    ANTIBIOTICTHERAPY =
-      if_else(!is.na(ANTIBIOTICTHERAPYHRS) & ANTIBIOTICTHERAPYHRS < VTEPROPHYLAXISHRS,
-              ANTIBIOTICTHERAPY, 0)
-  ) %>% 
-  
-  # convert any remaining NA in the three columns to 0
-  mutate(across(c(ANGIOGRAPHY, HMRRHGCTRLSURGTYPE, ANTIBIOTICTHERAPY),
-                ~ replace_na(.x, 0))) %>% 
-  # anticoagulation in the ER
-  mutate(
-    ED_VTE = if_else(
-      !is.na(EDDISCHARGEHRS) & !is.na(VTEPROPHYLAXISHRS) &
-        EDDISCHARGEHRS > VTEPROPHYLAXISHRS,
-      1L,              
-      0L              
-    )
+  # Drop variables that are not needed or have extensive missingness
+  select(
+    -inc_key, -V1, -EMSNOTIFYHRS, -EMSLEFTHRS, -EMSDepartureHrs, -InpatientHrs,
+    -HOSPITALDISCHARGEHRS, -HIGHESTACTIVATION, -TRAUMASURGEONARRIVALHRS,
+    -WITHDRAWALLSTHRS, -LOWESTSBP, -ICP_NA, -DEATHINED, -RACE_NA, -TCC_NA,
+    -VPO_NA, -PREHOSPITALCARDIACARREST, -GCSQ_NA, -PMGCSQ_NA, -starts_with("HE_")  
   ) %>%
-  # drop the now-redundant *_HRS columns
-  select(-ANTIBIOTICTHERAPYHRS, -ANGIOGRAPHYHRS, -HMRRHGCTRLSURGHRS)
-  
+  # Convert all columns to numeric, suppressing warnings for NAs
+  mutate(across(everything(), ~ suppressWarnings(as.numeric(.x))))
 
-
-
-# Converting all transfusion products to units given
-## Lookup table 
-vol_par <- tibble::tribble(
-  ~prod,   ~unit_vol, ~hours_var,        ~measure_var,       ~conv_var,
-  "PRBC",  300,       "BLOOD4HOURS",     "BLOODMEASURE",     "BLOODCONVERSION",
-  "PLT",   250,       "PLATELETS4HOURS", "PLATELETSMEASURE", "PLATELETSCONVERSION",
-  "CRYO",   15,       "CRYOPRECIPITATE4HOURS",  "CRYOPRECIPITATEMEASURE","CRYOPRECIPITATECONVERSION",
-  "FFP",   250,       "PLASMA4HOURS",    "PLASMAMEASURE",    "PLASMACONVERSION"
-  #,"WB",   500,       "WHOLEBLOOD4HOURS","WHOLEBLOODMEASURE","WHOLEBLOODCONVERSION"
-)
-
-# helper (unchanged)
-ml2unit_fix <- function(x, measure, default_vol,
+# ── 3 · Blood Product Unit Conversion ────────────────────────────────────────
+# Helper function remains the same
+## ── Blood-product helpers ─────────────────────────────────────────────────
+## ── Helper: mL ➜ units (base‐R internals) ──────────────────────────────────
+ml2unit_fix <- function(x,
+                        measure,          # 1 = “already units”, 2 = millilitres
+                        default_vol,      # mL per unit if conv is NA
                         conv        = NA_real_,
                         max_units   = 60,
-                        min_u_thres = 0.5) {
-  u <- dplyr::case_when(
-    measure == 1 & x >= min_u_thres               ~ x,
-    measure == 1 & x <  min_u_thres               ~ x / default_vol,
-    measure == 2 & !is.na(conv)                   ~ x / conv,
-    measure == 2 &  is.na(conv) & x >= default_vol~ x / default_vol,
-    measure == 2 &  is.na(conv) & x <  default_vol~ x,
-    TRUE                                          ~ NA_real_
+                        min_units   = 0.5,
+                        round_dec   = 1) {
+  
+  # pick the appropriate divisor row-by-row
+  ml_per_unit <- ifelse(is.na(conv), default_vol, conv)
+  
+  # convert to units or leave as-is
+  units <- ifelse(
+    measure == 1 & !is.na(x),                         x,
+    ifelse(measure == 2 & !is.na(x), x / ml_per_unit, NA_real_)
   )
-  ifelse(u > max_units | u < 0, NA_real_, u)
+  
+  # tiny positive amounts (<0.5 U) count as 1 whole unit
+  units <- ifelse(units > 0 & units < min_units, 1, units)
+  
+  # clamp implausible or negative values
+  units[units < 0 | units > max_units] <- NA_real_
+  
+  # optional rounding
+  round(units, round_dec)
 }
 
-# main pipeline
-df <- df %>% 
+## ── Apply to each product, tidy clean-up, plausibility gate ───────────────
+df_cleaned <- df_processed %>% 
   mutate(
     PRBC_units  = ml2unit_fix(BLOOD4HOURS,          BLOODMEASURE,          300, BLOODCONVERSION),
     PLT_units   = ml2unit_fix(PLATELETS4HOURS,      PLATELETSMEASURE,      250, PLATELETSCONVERSION),
-    CRYO_units  = ml2unit_fix(CRYOPRECIPITATE4HOURS,CRYOPRECIPITATEMEASURE,15,  CRYOPRECIPITATECONVERSION),
+    CRYO_units  = ml2unit_fix(CRYOPRECIPITATE4HOURS,CRYOPRECIPITATEMEASURE,  15, CRYOPRECIPITATECONVERSION),
     FFP_units   = ml2unit_fix(PLASMA4HOURS,         PLASMAMEASURE,         250, PLASMACONVERSION)
-    # ,WB_units = ml2unit_fix(WHOLEBLOOD4HOURS, WHOLEBLOODMEASURE, 500, WHOLEBLOODCONVERSION)
+  ) %>% 
+  
+  # drop the raw mL columns
+  select(
+    -starts_with("BLOOD"), -starts_with("PLATELETS"),
+    -starts_with("CRYOPRECIPITATE"), -starts_with("PLASMA"),
+    -WHOLEBLOOD4HOURS
+  ) %>% 
+  
+  # replace remaining NAs in *_units with 0
+  mutate(across(ends_with("_units"), \(x) tidyr::replace_na(x, 0))) %>%
+  # plausibility filter
+  filter(
+    !(
+      (PRBC_units >= 10 & (PLT_units < 1 | FFP_units < 1 | CRYO_units < 1)) |
+        PRBC_units  > 60 | PLT_units > 30 | FFP_units > 60 | CRYO_units > 50
+    )
+  )
+
+setDT(df_cleaned)
+
+## ── 1 · Pre-compute key variables (no copy) ────────────────────────────────
+df_cleaned[, `:=`(
+  id        = .I,                       # row number → id
+  end_time4 = floor(VTEPROPHYLAXISHRS/4)   # store once; avoids recomputing
+)]
+
+## ── 2 · Expand to long (4-h grid) with CJ() ────────────────────────────────
+# For each id build the sequence 0,4,8,…,end_time
+grid <- df_cleaned[, .(time = seq(0, end_time4*4, by = 4)), by = id]
+
+# Merge the patient-level columns onto the time grid
+long <- merge(grid, df_cleaned, by = "id", all.x = TRUE)
+
+## ── 3 · time-varying vars (first set) ──────────────────────────
+long[, `:=`(
+  VTE_prophylaxis  = +(time == end_time4*4),
+  GCS_Motor_tv     = fifelse(time < 24, GCSMOTOR, TBIGCSMOTOR),
+  On_Ventilator_tv = fifelse(time < 24,
+                             +(GCSQ_INTUBATED==1 | RESPIRATORYASSISTANCE==1),
+                             +(PMGCSQ_INTUBATED==1 | GCSQ_INTUBATED==1 |
+                                 RESPIRATORYASSISTANCE==1)),
+  Midline_Shift_tv = fifelse(time < 24, 0, TBIMIDLINESHIFT),
+  Patient_Location_tv = fcase(
+    time < EDDISCHARGEHRS,            "ED",
+    EDDISCHARGEDISPOSITION==1,        "Floor",
+    EDDISCHARGEDISPOSITION==2,        "Observation",
+    EDDISCHARGEDISPOSITION==3,        "Step-down",
+    EDDISCHARGEDISPOSITION==7,        "Operating_Room",
+    EDDISCHARGEDISPOSITION==8,        "ICU",
+    default = "Discharged_from_ED")
+), by = id]
+
+## ── 3b · add *_units_tv in a separate call ────────────────────
+unitCols <- grep("_units$", names(long), value = TRUE)
+
+long[, (paste0(unitCols, "_tv")) :=
+       lapply(.SD, \(x) fifelse(time < 4, 0, x)),
+     .SDcols = unitCols, by = id]
+
+## ── 4 · Time-dependent interventions (compare once, then recycle) ──────────
+long[, Angiography_tv :=
+       fifelse( is.na(ANGIOGRAPHYHRS), 0L,        # never got it → 0
+                as.integer(time >= ANGIOGRAPHYHRS) ),
+     by = id]
+
+long[, Surgery_for_Hemorrhage_tv :=
+       fifelse( is.na(HMRRHGCTRLSURGHRS), 0L,
+                as.integer(time >= HMRRHGCTRLSURGHRS) ),
+     by = id]
+
+long[, Antibiotic_Therapy_tv :=
+       fifelse( is.na(ANTIBIOTICTHERAPYHRS), 0L,
+                as.integer(time >= ANTIBIOTICTHERAPYHRS) ),
+     by = id]
+
+## ── 5 · Last-observation-carried-forward fill (fast rolling join) ─────────
+# choose the columns that need LOCF
+fill_vars <- c("GCS_Motor_tv", "On_Ventilator_tv",
+               "Midline_Shift_tv", "Patient_Location_tv",
+               grep("_tv$", names(long), value = TRUE))
+
+setorderv(long, c("id","time"))          # ensure sorted
+# encode as factor → integer
+long[, Patient_Location_code := as.integer(factor(Patient_Location_tv))]
+
+# numeric LOCF
+long[, Patient_Location_code := nafill(Patient_Location_code, type = "locf"),
+     by = id]
+
+# decode back to original labels
+labs <- levels(factor(long$Patient_Location_tv))
+long[, Patient_Location_tv := labs[Patient_Location_code]]
+
+# optional: drop helper column
+long[, Patient_Location_code := NULL]
+
+# drop helper column
+long[, end_time4 := NULL]
+
+
+# ── 5 · Final Cleanup and Export for Weighting ───────────────────────────────
+df_weighting <- long %>%
+  # One-hot encode the key categorical variables
+  fastDummies::dummy_cols(
+    select_columns = c("VTEPROPHYLAXISTYPE", "Patient_Location_tv", "ETHNICITY", 
+                       "TBIPUPILLARYRESPONSE", 
+                       "HMRRHGCTRLSURGTYPE", "ANGIOGRAPHY"),
+    remove_selected_columns = TRUE,
+    ignore_na = TRUE
+  ) %>%
+  # Remove raw variables that are now encoded in the time-varying format or are outcomes
+  select(
+    -VTEPROPHYLAXISHRS, -EDDISCHARGEHRS, -EDDISCHARGEDISPOSITION,
+    -TBIGCSMOTOR, -TBIMIDLINESHIFT, -GCSQ_INTUBATED, -RESPIRATORYASSISTANCE,
+    -PMGCSQ_INTUBATED, -starts_with("ANGIOGRAPHY", ignore.case = FALSE), 
+    -starts_with("HMRRHGCTRLSURG", ignore.case = FALSE),
+    -starts_with("ANTIBIOTIC", ignore.case = FALSE), -ends_with("_units"),
+    -FINALDISCHARGEHRS, -WITHDRAWALLST # Remove outcomes
+  )
+
+
+na_table <- df_weighting %>% 
+  summarise(across(everything(),
+                   ~ sum(is.na(.x)))) %>% 
+  tidyr::pivot_longer(everything(),
+                      names_to  = "variable",
+                      values_to = "n_NA") %>% 
+  arrange(desc(n_NA))
+
+print(na_table, n = Inf)   # show all rows
+
+
+# Save the weighting dataset
+fwrite(df_weighting, "df_weighting.csv")
+
+# Clustering Dataset Creation--------------------------------------------------------------
+
+df_km <- df_processed %>% 
+  mutate(
+    PRBC_units  = ml2unit_fix(BLOOD4HOURS,          BLOODMEASURE,          300, BLOODCONVERSION),
+    PLT_units   = ml2unit_fix(PLATELETS4HOURS,      PLATELETSMEASURE,      250, PLATELETSCONVERSION),
+    CRYO_units  = ml2unit_fix(CRYOPRECIPITATE4HOURS,CRYOPRECIPITATEMEASURE,  15, CRYOPRECIPITATECONVERSION),
+    FFP_units   = ml2unit_fix(PLASMA4HOURS,         PLASMAMEASURE,         250, PLASMACONVERSION)
   ) %>% 
   select(
-    -BLOOD4HOURS,      -BLOODMEASURE,      -BLOODCONVERSION,
-    -PLATELETS4HOURS,  -PLATELETSMEASURE,  -PLATELETSCONVERSION,
-    -CRYOPRECIPITATE4HOURS, -CRYOPRECIPITATEMEASURE, -CRYOPRECIPITATECONVERSION,
-    -PLASMA4HOURS,     -PLASMAMEASURE,     -PLASMACONVERSION,
-    -WHOLEBLOOD4HOURS #, -WHOLEBLOODMEASURE, -WHOLEBLOODCONVERSION
+    -starts_with("BLOOD"), -starts_with("PLATELETS"),
+    -starts_with("CRYOPRECIPITATE"), -starts_with("PLASMA"),
+    -WHOLEBLOOD4HOURS
   ) %>% 
-  mutate(across(ends_with("_units"), ~ replace_na(.x, 0)))
+  mutate(across(ends_with("_units"), \(x) replace_na(x, 0)))
 
-# flag rows that still look impossible / unbalanced
-bad_tbl <- df %>% 
-  mutate(bad_row =
-           (PRBC_units >= 10 & (PLT_units < 1 | FFP_units < 1 | CRYO_units < 1)) |
-           PRBC_units  > 60 | PLT_units  > 30 | FFP_units > 60 | CRYO_units > 50 |
-           PRBC_units  < 0  | PLT_units  < 0  | FFP_units < 0  | CRYO_units < 0) %>% 
-  filter(bad_row) %>% 
-  select(-bad_row)
-
-# drop those rows from the working data
-df <- df %>% 
+## ── 2 · OPTIONAL plausibility filter (same rules) ─────────────────────────
+df_km <- df_km %>% 
   filter(
-    !( (PRBC_units >= 10 & (PLT_units < 1 | FFP_units < 1 | CRYO_units < 1)) |
-         PRBC_units  > 60 | PLT_units  > 30 | FFP_units > 60 | CRYO_units > 50 |
-         PRBC_units  < 0  | PLT_units  < 0  | FFP_units < 0  | CRYO_units < 0 )
-  )
-
-
-# Making sure all timed interventions or events are before VTEPROPHYLAXISHRS
-icp_cols <- grep("^ICP", names(df), value = TRUE)
-
-df <- df %>% 
-  ## Zero-out ICP values taken *after* VTE prophylaxis started
-  mutate(
-    across(
-      all_of(icp_cols),
-      ~ if_else(
-        !is.na(TBICEREBRALMONITORHRS) &
-          !is.na(VTEPROPHYLAXISHRS)      &
-          TBICEREBRALMONITORHRS >= VTEPROPHYLAXISHRS,
-        0,        # after prophylaxis  → 0
-        .x        # otherwise keep
-      )
-    )
-  ) %>% 
-  mutate(
-    ICP_Unknown = if_else(
-      !is.na(TBICEREBRALMONITORHRS) &                       # monitor time recorded
-        if_all(all_of(icp_cols), ~ is.na(.x) | .x == 0),      # every ICP value NA or 0
-      1L,                                                   # flag as 1
-      0L                                                    # else 0
-    )
-  ) %>% 
-  select(-TBICEREBRALMONITORHRS) %>%
-  mutate(ICP_Unknown = replace_na(ICP_Unknown, 0))
-
-# Adding time dependent variables, making sure not to add variables after vteprophylaxishrs
-df <- df %>% 
-  # creating ICU Variable
-  mutate(
-    ICU_Before_VTE = ifelse(
-      !is.na(EDDISCHARGEDISPOSITION) & EDDISCHARGEDISPOSITION == 8 &
-        !is.na(EDDISCHARGEHRS) & !is.na(VTEPROPHYLAXISHRS) &
-        EDDISCHARGEHRS < VTEPROPHYLAXISHRS,
-      1,
-      0
-    )
-  ) %>%
-  # creating ventilator variable
-  mutate(
-    Ventilator_Before_VTE = ifelse(
-      !is.na(RESPIRATORYASSISTANCE) & RESPIRATORYASSISTANCE == 1 & # Assuming 1 means assisted based on previous recode logic
-        !is.na(TOTALVENTDAYS) & TOTALVENTDAYS >= 1, # If any ventilator days are recorded
-      1,
-      0
-    )
-  ) %>%
-  # CT scan shows shift in brain 24 hours after admission
-  mutate(
-    TBIMIDLINESHIFT = if_else(
-      !is.na(VTEPROPHYLAXISHRS) & VTEPROPHYLAXISHRS < 19,
-      0,
-      TBIMIDLINESHIFT
+    !(
+      (PRBC_units >= 10 & (PLT_units < 1 | FFP_units < 1 | CRYO_units < 1)) |
+        PRBC_units  > 60 | PLT_units > 30 | FFP_units > 60 | CRYO_units > 50
     )
   )
 
-df <- df %>%
-  select(-TOTALVENTDAYS, -TOTALICULOS, -EDDISCHARGEHRS)
+## ── 3 · ONE-HOT ENCODE key categoricals for k-means  ──────────────────────
+df_km <- df_km %>% 
+  fastDummies::dummy_cols(
+    select_columns = c("VTEPROPHYLAXISTYPE", "ETHNICITY",
+                       "TBIPUPILLARYRESPONSE", "HMRRHGCTRLSURGTYPE"),
+    remove_selected_columns = TRUE,
+    ignore_na = TRUE
+  )
 
-write.csv(df, "df_clean.csv")
+## ── 4 · (Optional) replace remaining NA with column median 
+df_km <- df_km %>% 
+  mutate(across(where(is.numeric),
+                \(x) replace_na(x, median(x, na.rm = TRUE))))
 
-# Removing remaining variables after vteprophylaxishrs
-df <- df %>%
-  select(-FINALDISCHARGEHRS, -WITHDRAWALLST)
 
-write.csv(df, "df_weighting.csv")
+fwrite(as.data.table(df_km), "df_kmeans.csv")
