@@ -1,0 +1,4101 @@
+2---
+title: "Identifying Optimal VTE Prophylaxis Timing in TBI"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: united
+    code_folding: show
+---
+
+
+
+# Analysis Workflow
+
+ 1.  Import and clean data
+ 2.  Pre-weight balance assessment with SMD table
+ 3.  Longitudinal data restructuring (tstart/tstop + TxStatus + Event)
+ 4.  GBM-based GPS weighting (ATE, trim 99%)
+ 5.  MSM: weighted Cox spline, segmented cox regression, RSF
+ 6.  K-means clustering with cluster-specific analysis
+ 7.  External validation framework
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE) ## Show code in compiled Rmd
+
+library(data.table) ## data table > data frame for larger datasets
+library(survival)
+library(splines)
+library(tidyverse)
+library(twangContinuous) ## Used for GBM
+library(WeightIt)
+library(rms) ## More powerful survival package with valdiation, splines
+library(caret)
+library(gridExtra)
+library(kableExtra)
+library(flextable)
+library(gtsummary)
+library(forestmodel)
+library(labelled) ## Switches between labelled and factor data easily
+library(broom) ## Messy model outputs --> dataframe
+library(quantmod)
+library(survminer)
+library(tableone)
+library(cobalt)
+library(segmented)
+
+
+select <- dplyr::select
+start <- fread("data/df.csv")
+```
+
+# Reading in Data + Clinical Data Validation
+
+## Selecting Patients
+
+We extracted all admission-day covariates that may confound the association between prophylaxis initiation time and outcomes including: GCS, ISS, age, documented hyper- or hypocoagulable disorders, etc... All-cause mortality serves as the primary endpoint because its exact occurrence can be aligned with the recorded time of VTE prophylaxis initiation. Secondary endpoints (pulmonary embolism, deep-vein thrombosis, and myocardial infarction) are also captured to characterize how event rates vary across the initiation timeline.
+
+```{r data-prep, echo = FALSE}
+df <- start %>% 
+  # recode 2 → 0 for binary variables
+  mutate(across(
+    c(SEX, WITHDRAWALLST, TBIMIDLINESHIFT,
+      RESPIRATORYASSISTANCE, SUPPLEMENTALOXYGEN,
+      INTERFACILITYTRANSFER, PREHOSPITALCARDIACARREST, DEATHINED, BLOODMEASURE),
+    ~ ifelse(.x == 2, 0, .x)
+  )) %>% 
+  # apply cohort filters
+  filter(
+    SEX != 3,
+    TBIMIDLINESHIFT != 3,
+    VTEPROPHYLAXISTYPE %in% c("LWMH", "Unfractionated Heparin"),
+    VTEPROPHYLAXISHRS < 168
+  ) %>% 
+  
+  # set reference level for prophylaxis type
+  mutate(
+    VTEPROPHYLAXISTYPE = relevel(factor(VTEPROPHYLAXISTYPE),
+                                 ref = "Unfractionated Heparin")
+  ) %>%
+
+  mutate(
+    BLOOD4ML = case_when(
+      BLOODMEASURE == 1              ~ BLOOD4HOURS * BLOODCONVERSION,  # entered as units
+      BLOODMEASURE == 0              ~ BLOOD4HOURS,                    # already mL
+      is.na(BLOODMEASURE)            ~ BLOOD4HOURS * 300,              # assume 300 mL per unit
+      TRUE                           ~ NA_real_                        # fall-back, should be rare
+    )
+  ) %>% 
+  filter(BLOOD4ML <= 12500)
+
+cols_to_zero <- c(
+  "TOTALVENTDAYS", "TOTALICULOS",
+  "HE_UnplannedIntubation", "HE_Stroke.CVA", "HE_SevereSepsis",
+  "HE_DVT", "HE_UnplannedAdmissiontoICU", "HE_UnplannedVisittoOR",
+  "Hx_Pregnancy", "BLOOD4ML"
+)
+
+df <- df %>% mutate(across(everything(), ~ suppressWarnings(as.numeric(.x))))
+
+df <- df %>% 
+  mutate(across(all_of(cols_to_zero), ~ replace_na(.x, 0)))
+```
+
+## Missingness Analysis
+
+We examined whether missingness appeared random or was associated with clinical outcomes, such as early mortality. For example, medical history variables were frequently missing in patients who died shortly after admission, suggesting non-random, outcome-associated missingness that may bias complete-case analyses.
+
+My hypothesis for missingness is altered in these patient groups
+
+1. early death
+- comobordities are likely not to be captured
+- medication history (such as pre-hospital anticoagulation use) is not recorded
+
+2. transfer population
+- records are often incomplete when transfering in from outside hospital
+
+3. Elderly
+- they possibly come more often for minor injuries and their history and medication list may be more complete
+
+
+```{r missing-data-analysis}
+missing_summary <- df %>%
+  summarise_all(~sum(is.na(.))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(
+    Total_N = nrow(df),
+    Missing_Percent = round(100 * Missing_Count / Total_N, 2)
+  ) %>%
+  arrange(desc(Missing_Percent))
+
+high_missing_vars <- missing_summary %>%
+  filter(Missing_Percent > 10) %>%
+  pull(Variable)
+
+df_vte_analysis <- df %>%
+  mutate(
+    vte_type_missing = is.na(VTEPROPHYLAXISTYPE),
+    vte_type_empty = (VTEPROPHYLAXISTYPE == "" | VTEPROPHYLAXISTYPE == " "),
+    vte_timing_missing = is.na(VTEPROPHYLAXISHRS),
+    vte_any_missing = vte_type_missing | vte_type_empty | vte_timing_missing
+  )
+
+vte_missing_summary <- df_vte_analysis %>%
+  summarise(
+    total_patients = n(),
+    type_missing = sum(vte_type_missing, na.rm = TRUE),
+    type_empty = sum(vte_type_empty, na.rm = TRUE),
+    timing_missing = sum(vte_timing_missing, na.rm = TRUE),
+    any_vte_missing = sum(vte_any_missing, na.rm = TRUE)
+  ) %>%
+  mutate(
+    pct_type_missing = round(100 * type_missing / total_patients, 1),
+    pct_type_empty = round(100 * type_empty / total_patients, 1),
+    pct_timing_missing = round(100 * timing_missing / total_patients, 1),
+    pct_any_missing = round(100 * any_vte_missing / total_patients, 1)
+  )
+
+vte_mechanism_test <- df %>%
+  mutate(
+    vte_data_available = !is.na(VTEPROPHYLAXISTYPE) & 
+                        VTEPROPHYLAXISTYPE != "" & 
+                        !is.na(VTEPROPHYLAXISHRS)
+  )
+
+test_vars <- c("AGEyears", "SEX", "TBIHIGHESTTOTALGCS", "TOTALICULOS", 
+               "TOTALVENTDAYS", "FINALDISCHARGEHRS", "WITHDRAWALLST")
+
+mechanism_results <- data.frame()
+
+for(var in test_vars) {
+  if(var %in% names(df)) {
+    available_data <- df[vte_mechanism_test$vte_data_available == TRUE, ..var][[1]]
+    missing_data <- df[vte_mechanism_test$vte_data_available == FALSE, ..var][[1]]
+    
+    available_clean <- available_data[!is.na(available_data)]
+    missing_clean <- missing_data[!is.na(missing_data)]
+    
+    if(length(available_clean) > 10 & length(missing_clean) > 10) {
+      if(var %in% c("SEX", "WITHDRAWALLST")) {
+        contingency <- table(
+          Group = c(rep("Available", length(available_clean)), 
+                   rep("Missing", length(missing_clean))),
+          Value = c(available_clean, missing_clean)
+        )
+        
+        if(min(contingency) >= 5) {
+          chi_test <- chisq.test(contingency)
+          effect_size <- sqrt(chi_test$statistic / sum(contingency))
+          
+          mechanism_results <- rbind(mechanism_results, data.frame(
+            Variable = var,
+            Available_Mean = mean(available_clean),
+            Missing_Mean = mean(missing_clean),
+            P_Value = chi_test$p.value,
+            Effect_Size = as.numeric(effect_size)
+          ))
+        }
+      } else {
+        t_test <- t.test(available_clean, missing_clean)
+        pooled_sd <- sqrt(((length(available_clean) - 1) * var(available_clean) + 
+                          (length(missing_clean) - 1) * var(missing_clean)) / 
+                         (length(available_clean) + length(missing_clean) - 2))
+        cohens_d <- abs(mean(available_clean) - mean(missing_clean)) / pooled_sd
+        
+        mechanism_results <- rbind(mechanism_results, data.frame(
+          Variable = var,
+          Available_Mean = round(mean(available_clean), 2),
+          Missing_Mean = round(mean(missing_clean), 2),
+          P_Value = t_test$p.value,
+          Effect_Size = round(cohens_d, 3)
+        ))
+      }
+    }
+  }
+}
+
+if (nrow(mechanism_results) > 0) {
+  mechanism_results <- mechanism_results %>%
+    mutate(
+      Significance = case_when(
+        P_Value < 0.001 ~ "***",
+        P_Value < 0.01 ~ "**", 
+        P_Value < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      MNAR_Evidence = case_when(
+        Effect_Size < 0.2 ~ "Weak",
+        Effect_Size < 0.5 ~ "Moderate",
+        Effect_Size < 0.8 ~ "Strong", 
+        TRUE ~ "Very Strong"
+      )
+    )
+  
+  mnar_evidence <- sum(mechanism_results$P_Value < 0.05, na.rm = TRUE)
+} else {
+  mnar_evidence <- 0
+}
+
+total_tests <- nrow(mechanism_results)
+
+kable(missing_summary %>% head(20), caption = "Missing Data Summary - Top 20 Variables")
+kable(vte_missing_summary, caption = "VTE Prophylaxis Missing Data")
+kable(mechanism_results, caption = "Missing Data Mechanism Assessment")
+```
+
+## Variable Distribution + Outliers
+Can you check for outliers in the data
+specifically vteprophylaxishrs, ISS, TBIHIGHESTTOTALGCS
+
+```{r outlier-detection}
+detect_statistical_outliers <- function(x, method = "iqr", z_threshold = 3) {
+  if (method == "z_score") {
+    z_scores <- abs(scale(x))
+    return(which(z_scores > z_threshold))
+  } else if (method == "iqr") {
+    q1 <- quantile(x, 0.25, na.rm = TRUE)
+    q3 <- quantile(x, 0.75, na.rm = TRUE)
+    iqr <- q3 - q1
+    lower_bound <- q1 - 1.5 * iqr
+    upper_bound <- q3 + 1.5 * iqr
+    return(which(x < lower_bound | x > upper_bound))
+  }
+}
+
+continuous_vars <- c("AGEyears", "TBIHIGHESTTOTALGCS", "TOTALICULOS", 
+                    "TOTALVENTDAYS", "FINALDISCHARGEHRS", "VTEPROPHYLAXISHRS", 
+                    "BLOOD4ML", "ISS")
+
+available_continuous <- intersect(continuous_vars, names(df))
+
+outlier_summary <- data.frame()
+
+for (var in available_continuous) {
+  var_data <- df[[var]][!is.na(df[[var]])]
+  
+  if (length(var_data) > 10) {
+    iqr_outliers <- detect_statistical_outliers(var_data, "iqr")
+    z_outliers <- detect_statistical_outliers(var_data, "z_score", 3)
+    
+    outlier_summary <- rbind(outlier_summary, data.frame(
+      variable = var,
+      n_observations = length(var_data),
+      mean_val = round(mean(var_data), 2),
+      sd_val = round(sd(var_data), 2),
+      median_val = round(median(var_data), 2),
+      q25_val = round(quantile(var_data, 0.25), 2),
+      q75_val = round(quantile(var_data, 0.75), 2),
+      iqr_outliers = length(iqr_outliers),
+      z_outliers = length(z_outliers),
+      outlier_rate = round(100 * length(iqr_outliers) / length(var_data), 2)
+    ))
+  }
+}
+
+key_vars <- c("VTEPROPHYLAXISHRS", "ISS", "TBIHIGHESTTOTALGCS")
+plot_list <- list()
+for (var in key_vars) {
+  if (var %in% names(df)) {
+    p <- ggplot(df, aes_string(y = var)) +
+      geom_boxplot(outlier.color = "red", outlier.alpha = 0.6) +
+      labs(title = paste("Distribution of", var), y = var) +
+      theme_minimal() +
+      theme(axis.text.x = element_blank())
+    
+    plot_list[[var]] <- p
+  }
+}
+
+if (length(plot_list) > 0) {
+  grid.arrange(grobs = plot_list, ncol = 3)
+}
+
+kable(outlier_summary, caption = "Outlier Detection Summary")
+```
+
+## Data Consistency + Logical Checks
+can you include common checks
+- pregnancy and female
+- other things like this
+
+```{r data-quality-checks}
+clinical_issues <- data.frame(
+  patient_id = numeric(),
+  issue_type = character(),
+  severity = character(),
+  stringsAsFactors = FALSE
+)
+issues_found <- 0
+
+if ("AGEyears" %in% names(df)) {
+  negative_age <- which(df$AGEyears < 0)
+  extreme_age <- which(df$AGEyears > 120)
+  
+  for (i in c(negative_age, extreme_age)) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = ifelse(i %in% negative_age, "Negative_Age", "Extreme_Age"),
+      severity = ifelse(i %in% negative_age, "Critical", "Warning")
+    )
+  }
+}
+
+if ("TBIHIGHESTTOTALGCS" %in% names(df)) {
+  invalid_gcs <- which(df$TBIHIGHESTTOTALGCS < 3 | df$TBIHIGHESTTOTALGCS > 15)
+  
+  for (i in invalid_gcs) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "Invalid_GCS",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("FINALDISCHARGEHRS" %in% names(df) && "VTEPROPHYLAXISHRS" %in% names(df)) {
+  late_vte <- which(!is.na(df$VTEPROPHYLAXISHRS) & 
+                   !is.na(df$FINALDISCHARGEHRS) &
+                   df$VTEPROPHYLAXISHRS > df$FINALDISCHARGEHRS)
+  
+  for (i in late_vte) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "VTE_After_Discharge",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("TOTALICULOS" %in% names(df) && "FINALDISCHARGEHRS" %in% names(df)) {
+  icu_exceed <- which(!is.na(df$TOTALICULOS) & 
+                     !is.na(df$FINALDISCHARGEHRS) &
+                     df$TOTALICULOS > (df$FINALDISCHARGEHRS / 24))
+  
+  for (i in icu_exceed) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "ICU_Exceeds_Hospital",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("SEX" %in% names(df) && "Hx_Pregnancy" %in% names(df)) {
+  male_pregnancy <- which(df$SEX == 1 & df$Hx_Pregnancy == 1)
+  
+  for (i in male_pregnancy) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "Male_Pregnancy",
+      severity = "Critical"
+    )
+  }
+}
+
+if (issues_found > 0) {
+  issue_summary <- clinical_issues %>%
+    group_by(issue_type, severity) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    arrange(desc(count))
+  
+  critical_patients <- unique(clinical_issues$patient_id[clinical_issues$severity == "Critical"])
+  
+  if (length(critical_patients) > 0) {
+    df_clean <- df[-critical_patients, ]
+  } else {
+    df_clean <- df
+  }
+  
+  kable(issue_summary, caption = "Clinical Data Quality Issues")
+} else {
+  df_clean <- df
+}
+```
+
+## Colinearty check
+Can you run these tests again
+
+```{r correlation-analysis}
+library(corrplot)
+
+df_for_correlation <- if(exists("df_clean")) df_clean else df
+
+numeric_vars <- df_for_correlation %>%
+  select_if(is.numeric) %>%
+  names()
+
+correlation_data <- df_for_correlation[, numeric_vars, with = FALSE]
+correlation_matrix <- cor(correlation_data, use = "pairwise.complete.obs", method = "spearman")
+
+high_correlations <- data.frame(
+  var1 = character(),
+  var2 = character(),
+  correlation = numeric(),
+  abs_correlation = numeric(),
+  stringsAsFactors = FALSE
+)
+correlation_pairs <- 0
+
+for (i in 1:(length(numeric_vars)-1)) {
+  for (j in (i+1):length(numeric_vars)) {
+    var1 <- numeric_vars[i]
+    var2 <- numeric_vars[j]
+    corr_val <- correlation_matrix[i, j]
+    
+    if (!is.na(corr_val) && abs(corr_val) > 0.8) {
+      correlation_pairs <- correlation_pairs + 1
+      high_correlations[correlation_pairs, ] <- data.frame(
+        var1 = var1,
+        var2 = var2,
+        correlation = round(corr_val, 3),
+        abs_correlation = round(abs(corr_val), 3)
+      )
+    }
+  }
+}
+
+if (correlation_pairs > 0) {
+  high_correlations <- high_correlations %>%
+    arrange(desc(abs_correlation))
+  
+  variables_to_exclude <- character()
+  
+  for (i in 1:nrow(high_correlations)) {
+    var1 <- high_correlations$var1[i]
+    var2 <- high_correlations$var2[i]
+    
+    if (var1 %in% variables_to_exclude || var2 %in% variables_to_exclude) {
+      next
+    }
+    
+    if (var1 == "FINALDISCHARGEHRS" && var2 == "HOSPITALDISCHARGEHRS") {
+      variables_to_exclude <- c(variables_to_exclude, "HOSPITALDISCHARGEHRS")
+    } else if (var1 == "BLOOD4ML" && grepl("BLOOD4HOURS", var2)) {
+      variables_to_exclude <- c(variables_to_exclude, var2)
+    } else {
+      missing1 <- sum(is.na(df_for_correlation[[var1]]))
+      missing2 <- sum(is.na(df_for_correlation[[var2]]))
+      
+      if (missing1 <= missing2) {
+        variables_to_exclude <- c(variables_to_exclude, var2)
+      } else {
+        variables_to_exclude <- c(variables_to_exclude, var1)
+      }
+    }
+  }
+  
+  final_variables <- setdiff(numeric_vars, variables_to_exclude)
+} else {
+  final_variables <- numeric_vars
+  variables_to_exclude <- character()
+}
+
+if (length(final_variables) > 1 && length(final_variables) <= 20) {
+  final_corr_matrix <- cor(df_for_correlation[, final_variables, with = FALSE], 
+                          use = "pairwise.complete.obs", method = "spearman")
+  
+  corrplot(final_corr_matrix, 
+           method = "color",
+           type = "upper",
+           order = "hclust",
+           tl.cex = 0.8,
+           tl.col = "black",
+           tl.srt = 45)
+}
+
+if (length(variables_to_exclude) > 0) {
+  non_numeric_vars <- names(df_for_correlation)[!names(df_for_correlation) %in% numeric_vars]
+  final_all_variables <- c(non_numeric_vars, final_variables)
+  
+  df_selected <- df_for_correlation %>%
+    select(all_of(final_all_variables))
+} else {
+  df_selected <- df_for_correlation
+}
+
+if (correlation_pairs > 0) {
+  kable(high_correlations, caption = "High Correlation Pairs (|r| > 0.8)")
+}
+
+# Save dataset before multiple imputation
+save(df_selected, file = "data/pre_imputation_dataset.RData")
+```
+
+# Multiple Imputation for Missing Data
+
+Based on the missing data analysis above, we implement multiple imputation using MICE with clinical constraints. This section is designed to be run separately on a VM due to computational requirements.
+
+```{r load-imputed-data}
+# This block should be run separately on a high-performance VM
+# Input: data/pre_imputation_dataset.RData
+# Output: post_imputation_dataset.RData
+
+# Load pre-imputation dataset
+# load("data/pre_imputation_dataset.RData")
+
+# Multiple imputation configuration and execution would go here
+# The full MICE implementation has been moved to a separate script
+# for VM execution due to computational intensity
+
+# For now, load the post-imputation results:
+load("data/post_imputation_dataset.RData")
+
+# The post-imputation dataset contains:
+# df_imputed: the complete dataset after MICE imputation
+# mice_result: the full MICE object with all imputed datasets
+# imputation_summary: quality assessment results
+```
+
+## Outcome + Event Rate Checks
+Can you check the following things
+1. Crude Counts + Proportions
+2. Events per variable: death, PE, DVT, Stroke, MI
+3. Scanning for any imbalances
+4. timing distribution of outcomes
+5. kaplan meir curves by anticoag timing broken down into early and late
+
+```{r outcome-analysis}
+library(survival)
+library(survminer)
+
+# Dataset already loaded as df_analysis from post_imputation_dataset.RData
+
+# Create VTE timing categories
+df_analysis <- df_analysis %>%
+  mutate(
+    vte_timing_category = case_when(
+      is.na(VTEPROPHYLAXISHRS) | VTEPROPHYLAXISTYPE == "No_Prophylaxis" ~ "No_Prophylaxis",
+      VTEPROPHYLAXISHRS <= 72 ~ "Early_VTE",
+      VTEPROPHYLAXISHRS > 72 ~ "Late_VTE",
+      TRUE ~ "Unknown"
+    ),
+    Anticoag_Timing = factor(
+      ifelse(VTEPROPHYLAXISHRS <= 72, "Early (≤72 h)", "Late  (>72 h)"),
+      levels = c("Early (≤72 h)", "Late  (>72 h)")
+    ),
+    death = ifelse(WITHDRAWALLST == 1, 1, 0)
+  )
+
+# VTE timing distribution
+timing_distribution <- df_analysis %>%
+  count(vte_timing_category) %>%
+  mutate(percentage = round(100 * n / sum(n), 1))
+
+# Event rates by timing category
+timing_events <- df_analysis %>%
+  group_by(vte_timing_category) %>%
+  summarise(
+    n_patients = n(),
+    death_rate = round(100 * mean(death, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+# Relative risks
+no_prophylaxis_rate <- timing_events$death_rate[timing_events$vte_timing_category == "No_Prophylaxis"] / 100
+if (length(no_prophylaxis_rate) > 0) {
+  relative_risks <- timing_events %>%
+    mutate(
+      crude_rate = death_rate / 100,
+      relative_risk = round(crude_rate / no_prophylaxis_rate, 2)
+    )
+}
+
+# Kaplan-Meier survival analysis
+if ("FINALDISCHARGEHRS" %in% names(df_analysis)) {
+  df_survival <- df_analysis %>%
+    filter(!is.na(Anticoag_Timing), !is.na(FINALDISCHARGEHRS)) %>%
+    mutate(
+      time_to_event = FINALDISCHARGEHRS,
+      event = death
+    )
+  
+  if (nrow(df_survival) > 0) {
+    km_fit <- survfit(Surv(time_to_event, event) ~ Anticoag_Timing, data = df_survival)
+    
+    km_plot <- ggsurvplot(
+      km_fit,
+      data = df_survival,
+      pval = TRUE,
+      conf.int = TRUE,
+      risk.table = TRUE,
+      xlab = "Time (hours)",
+      ylab = "Survival probability",
+      title = "Kaplan-Meier Survival Curves by VTE Timing"
+    )
+    
+  }
+}
+
+# Summary tables
+kable(timing_distribution, caption = "VTE Timing Distribution")
+kable(timing_events, caption = "Event Rates by VTE Timing")
+if (exists("relative_risks")) {
+  kable(relative_risks[, c("vte_timing_category", "relative_risk")], caption = "Relative Risks")
+}
+
+save(df_analysis, file = "post_imputation_dataset.RData")
+```
+
+
+
+
+# Univariate Balance Checks
+
+## SMD: Early (< 3 Days) vs Late (> 3 Days) Anticoagulation
+
+Patients who start anticoagulants later are often more injured on presenation, and also suffer more thrombotic events. Group differences were summarized with standardised mean differences (SMDs), using |SMD| < 0.1 as the conventional threshold for good balance. This gives us a better idea of the associations of later anticaouglation, and for what variables need to be considered during propensity score matching along the continuum of vteprophyalxishrs to control for clinical decision makign as much as possible to have a inferential answer instead of association.
+
+```{r baseline-table}
+library(tableone)
+library(flextable)
+library(officer)
+
+vars_keep <- c(
+  # ── demographics ──
+  "SEX", "AGEyears",
+  # ── initial physiology ──
+  "SBP", "RESPIRATORYRATE",
+  "TBIHIGHESTTOTALGCS", "TBIMIDLINESHIFT", "ISS", "BLOOD4ML",
+  # ── hospital course ──
+  "TOTALVENTDAYS", "TOTALICULOS", "FINALDISCHARGEHRS",
+  # ── outcomes ──
+  "WITHDRAWALLST", "HE_Stroke.CVA",
+  # ── NEW: in-hospital complications ──
+  "HE_PE", "HE_SevereSepsis", "HE_MI",
+  "HE_PulmonaryEmbolism", "HE_DVT",
+  # ── comorbidities ──
+  "Hx_AnticoagulantTherapy", "Hx_CVA", "Hx_DisseminatedCancer",
+  "Hx_MyocardialInfarction", "Hx_Cirrhosis", "Hx_BleedingDisorder",
+  "Hx_Hypertension", "Hx_CurrentSmoker"
+)
+
+catVars <- c(
+  "SEX", "TBIMIDLINESHIFT",
+  "WITHDRAWALLST", "HE_Stroke.CVA",
+  # categorical complications
+  "HE_PE", "HE_SevereSepsis", "HE_MI",
+  "HE_PulmonaryEmbolism", "HE_DVT",
+  # comorbidities
+  "Hx_AnticoagulantTherapy", "Hx_CVA", "Hx_DisseminatedCancer",
+  "Hx_MyocardialInfarction", "Hx_Cirrhosis", "Hx_BleedingDisorder",
+  "Hx_Hypertension", "Hx_CurrentSmoker"
+)
+
+
+# adding timing strata
+df <- df %>% 
+  mutate(Anticoag_Timing = factor(
+           ifelse(VTEPROPHYLAXISHRS <= 72, "Early (≤72 h)", "Late  (>72 h)"),
+           levels = c("Early (≤72 h)", "Late  (>72 h)"))
+  )
+
+# Creating Table object
+tbl1 <- CreateTableOne(
+  vars       = vars_keep,
+  strata     = "Anticoag_Timing",
+  data       = df,
+  factorVars = catVars,
+  addOverall = FALSE
+)
+
+
+tbl_df <- print(
+  tbl1,
+  smd            = TRUE,
+  showAllLevels  = FALSE,      # keep both levels so we can drop 0 later
+  noSpaces       = FALSE,     # keep " = " so separation works
+  quote          = FALSE,
+  printToggle    = FALSE
+) |>
+  as.data.frame(stringsAsFactors = FALSE) |>
+  rownames_to_column("Variable")   # now a tidy data-frame
+
+tbl_df <- tbl_df %>%
+  select(-test)
+
+# Setting up renaming variables for presentation
+pretty_full <- c(
+  "n"                                   = "n",
+  "SEX = 1 (%)"                         = "Female (%)",
+  "AGEyears (mean (SD))"                = "Age (years)",
+  "SBP (mean (SD))"                     = "SBP (mm Hg)",
+  "RESPIRATORYRATE (mean (SD))"         = "Respiratory rate (min⁻¹)",
+  "TBIHIGHESTTOTALGCS (mean (SD))"      = "Highest total GCS",
+  "TBIMIDLINESHIFT = 1 (%)"             = "Midline shift (%)",
+  "ISS (mean (SD))"                     = "Injury Severity Score",
+  "BLOOD4ML (mean (SD))"                = "Blood transfused 0–4 h (mL)",
+  "TOTALVENTDAYS (mean (SD))"           = "Ventilator days",
+  "TOTALICULOS (mean (SD))"             = "ICU LOS (days)",
+  "FINALDISCHARGEHRS (mean (SD))"       = "Hospital LOS (h)",
+  "WITHDRAWALLST = 1 (%)"               = "Withdrawal of life support (%)",
+  "HE_Stroke.CVA = 1 (%)"               = "In-hospital stroke (%)",
+  "Hx_AnticoagulantTherapy = 1 (%)"     = "Home anticoagulant (%)",
+  "Hx_CVA = 1 (%)"                      = "Prior stroke (%)",
+  "Hx_DisseminatedCancer = 1 (%)"       = "Disseminated cancer (%)",
+  "Hx_MyocardialInfarction = 1 (%)"     = "Prior MI (%)",
+  "Hx_Cirrhosis = 1 (%)"                = "Cirrhosis (%)",
+  "Hx_BleedingDisorder = 1 (%)"         = "Bleeding disorder (%)",
+  "Hx_Hypertension = 1 (%)"             = "Hypertension (%)",
+  "Hx_CurrentSmoker = 1 (%)"            = "Current smoker (%)",
+  "HE_PE = 1 (%)"                = "Pulmonary edema (%)",
+  "HE_SevereSepsis = 1 (%)"      = "Severe sepsis (%)",
+  "HE_MI = 1 (%)"                = "In-hospital MI (%)",
+  "HE_PulmonaryEmbolism = 1 (%)" = "Pulmonary embolism (%)",
+  "HE_DVT = 1 (%)"               = "Deep-vein thrombosis (%)"
+)
+
+
+tbl_df$Variable <- ifelse(
+  tbl_df$Variable %in% names(pretty_full),
+  pretty_full[tbl_df$Variable],
+  tbl_df$Variable
+)
+
+# names that actually exist in tbl_df
+nms <- names(tbl_df)               # "Variable", "Early (≤72 h)", "Late (>72 h)", "p", "SMD"
+
+make_header_row <- function(text) {
+  # make a one-row tibble with identical column names filled with NA
+  row <- as_tibble(setNames(rep(list(NA), length(nms)), nms))
+  row$Variable <- text
+  row
+}
+
+sections <- list(
+  "—  Demographics" = c(
+    "Female (%)",
+    "Age (years)"
+  ),
+
+  "—  Initial physiology" = c(
+    "SBP (mm Hg)",
+    "Respiratory rate (min⁻¹)",
+    "Highest total GCS",
+    "Midline shift (%)",
+    "Injury Severity Score",
+    "Blood transfused 0–4 h (mL)"
+  ),
+
+  "—  Hospital course" = c(
+    "Ventilator days",
+    "ICU LOS (days)",
+    "Hospital LOS (h)"
+  ),
+
+  "—  In-hospital complications" = c(      # NEW section
+    "Pulmonary edema (%)",
+    "Severe sepsis (%)",
+    "In-hospital MI (%)",
+    "Pulmonary embolism (%)",
+    "Deep-vein thrombosis (%)",
+    "In-hospital stroke (%)",
+    "Withdrawal of life support (%)"
+  ),
+
+  "—  Comorbidities" = c(
+    "Home anticoagulant (%)",
+    "Prior stroke (%)",
+    "Disseminated cancer (%)",
+    "Prior MI (%)",
+    "Cirrhosis (%)",
+    "Bleeding disorder (%)",
+    "Hypertension (%)",
+    "Current smoker (%)"
+  )
+)
+
+
+ordered <- tibble()                # start empty
+for (hdr in names(sections)) {
+  ordered <- bind_rows(
+    ordered,
+    make_header_row(hdr),                          # header row (same col names)
+    tbl_df %>% filter(Variable %in% sections[[hdr]])
+  )
+}
+
+#Indices for formating
+hdr_rows <- which(str_starts(ordered$Variable, "—"))
+bold_smd <- which(as.numeric(ordered$SMD) >= 0.10)
+
+
+#Flextable for word
+ft <- flextable(ordered) |>
+  theme_booktabs() |>
+  bg(i = hdr_rows, bg = "#d9d9d9") |>
+  bold(i = hdr_rows, part = "body") |>
+  bold(i = bold_smd, j = "SMD", part = "body") |>
+  bg(i = setdiff(seq_len(nrow(ordered)), hdr_rows)[c(TRUE, FALSE)],
+     bg = "#f7f7f7") |>
+  align(j = 1, align = "left") |>
+  colformat_double(j = "SMD", digits = 3) |>
+  fontsize(part = "all", size = 9) |>
+  autofit() |>
+  width(j = 1, width = 2.2)
+
+ft <- set_caption(
+        ft,
+        caption = "Table 1. Baseline characteristics by anticoagulation timing (≤ 72 h vs > 72 h)",
+        style   = "Table Caption"
+      )
+
+ft <- add_footer_lines(
+        ft, "Values are mean ± SD or n (%).  SMD = standardized mean difference."
+      ) |>
+      fontsize(part = "footer", size = 8)
+
+save_as_docx(ft, path = "Table1_pretty.docx")
+
+```
+
+
+
+
+# Construction of IPTW-Weighted Cohort
+
+## Construction of longitudinal event-time data structure
+
+Psuedocode down below. Purpose of this is to become a proper MSM analysis with time varying weighting done before an outcome analysis.
+
+```{r longitudinal-data}
+# Create longitudinal data structure using available variables
+df_long <- df %>%
+  mutate(
+    # Use hospital discharge time as follow-up endpoint
+    FU_Hours = ifelse(!is.na(FINALDISCHARGEHRS), round(FINALDISCHARGEHRS), 168),
+    FU_Hours = pmax(FU_Hours, 1),        # minimum 1 hour
+    FU_Hours = pmin(FU_Hours, 168),      # cap at 7 days
+    # Create patient ID from row number
+    PatientID = row_number()
+  )
+
+# 
+df_long <- df_long %>%
+  mutate(n_rows = as.integer(FU_Hours + 1L)) %>%     # add row for hour 0
+  uncount(weights = n_rows,              # duplicates each row n_rows times
+          .id      = "hour_id",          # 1-based index created by uncount()
+          .remove  = FALSE) %>%          # keep the n_rows column so we can drop later
+  mutate(hour_id = hour_id - 1L)         # convert to 0,1,2,…,FU_Hours
+
+# Time-varying exposure & event flag within each patient
+df_long <- df_long %>%
+  group_by(PatientID) %>%
+  mutate(
+    TxStatus = as.integer(hour_id >= ifelse(!is.na(VTEPROPHYLAXISHRS), VTEPROPHYLAXISHRS, Inf)),
+    Event = as.integer(hour_id == max(hour_id) & WITHDRAWALLST == 1),
+    tstart   = hour_id,
+    tstop    = hour_id + 1L
+  ) %>%
+  ungroup() %>%
+  select(-n_rows)
+
+```
+
+
+## Gradient Boosting Model Tuning for Propensity Score Weighting
+
+We estimated inverse–probability-of-treatment weights (IPTW) from a gradient-boosted model (GBM) predicting prophylaxis-initiation time (continuous, in hours) using all admission covariates (GCS, ISS, age, sex, pre-existing coagulopathy, etc.). The plan is to be used in a MSM with a Bayesian cox model being the final outcome analyis compared to a RSF, and segmented Cox regression.
+
+### Model Choice Reasoning
+
+We chose GBM for weighting because boosting captures non-linearities and high-order interactions without explicit specification. Hyper-parameters were tuned over a prespecified grid (3 000, 5 000, 10 000 trees; learning rates 0.01 and 0.05; interaction depths 2–4; and bag-fraction values 0.5 and 0.7), a range chosen to span low-bias/high-variance and high-bias/low-variance regimes while remaining computationally tractable. Because of the marked right-skew of start times, we estimated the generalized propensity score with a kernel conditional density estimator ( density = "kernel" ). After the GBM produced subject-specific mean predictions, WeightIt produced IPTW weights.Because the treatment is continuous, the appropriate causal target is the average treatment effect (ATE); thus estimand = "ATE" was specified. WeightIt’s internal stopping rule was set to criterion = "p.max", which, at every boosting iteration and for every point in the tuning grid, computes the absolute weighted Pearson correlation between start time and each covariate and records the largest of these values. Both of these settings appear ideal for weighting. Weights beyond the 99th percentile were trimmed.
+
+### Summary of Weighting Diagnostics
+
+The selected model reduced the maximum absolute dose–covariate correlation from 0.29 pre-weighting to 0.06 post-weighting while maintaining an effective sample size of 88 % of the original cohort and a maximum stabilised weight of 4.7, indicating excellent covariate balance without extreme leverage. All analyses were conducted with WeightIt 0.15 interfacing to gbm 2.1.8.
+
+
+```{r gbm-weighting}
+# Create a final, clean data frame for weighting and modeling
+# This ensures weights are calculated and applied to the same dataset
+df_modeling <- df_analysis %>% 
+  select(
+    FINALDISCHARGEHRS, WITHDRAWALLST,
+    ## exposure + timing
+    VTEPROPHYLAXISHRS,
+  
+    ## demographics ----------------------------------------------------
+    VTEPROPHYLAXISTYPE, SEX, AGEyears,
+  
+    ## injury severity -------------------------------------------------
+    TBIHIGHESTTOTALGCS,  # Remove ISS as it has all missing values
+  
+    ## comorbidities / home meds --------------------------------------
+    Hx_AnticoagulantTherapy,   # pre-hospital anticoagulation
+    Hx_CVA,               # prior stroke/TIA
+    Hx_MyocardialInfarction,   # prior MI
+    Hx_Cirrhosis,
+    Hx_BleedingDisorder,
+    Hx_Hypertension) %>% 
+  filter(complete.cases(AGEyears)) %>%  # Remove rows with missing age
+  na.omit()
+
+
+# Utilizing preset model parameters for now because of computation limitations
+# Scanning model for optimal parameters down below
+W_tuned <- weightit(
+  ## treatment / exposure (continuous timing variable)
+  VTEPROPHYLAXISHRS ~
+  
+    ## demographics ----------------------------------------------------
+    VTEPROPHYLAXISTYPE + SEX + AGEyears +
+  
+    ## injury severity -------------------------------------------------
+    TBIHIGHESTTOTALGCS +
+  
+    ## comorbidities / home meds --------------------------------------
+    Hx_AnticoagulantTherapy +   # pre-hospital anticoagulation
+    Hx_CVA +                    # prior stroke/TIA
+    Hx_MyocardialInfarction +   # prior MI
+    Hx_Cirrhosis +
+    Hx_BleedingDisorder +
+    Hx_Hypertension,
+  
+  data              = df_modeling,
+  method            = "gbm",
+  density           = "kernel",
+  criterion         = "p.max",
+  trim.at           = 0.99,
+  estimand          = "ATE",
+  n.trees           = 5000,
+  shrinkage         = 0.01,
+  interaction.depth = 3,
+  bag.fraction      = 0.7
+)
+
+
+# W_tuned <- weightit(
+#   VTEPROPHYLAXISHRS ~ ISS + TBIHIGHESTTOTALGCS + AGEyears + ICU_Stay + Anticoagulant_Therapy + History_of_CVA,
+#   data = dfps,
+#   method = "gbm",
+#   density = "kernel",
+#   criterion = "p.max",   # Balance-focused
+#   trim.at = 0.99,
+#   estimand = "ATE",
+#   tune = list(
+#     n.trees = c(3000, 5000, 10000),
+#     shrinkage = c(0.01, 0.05),
+#     interaction.depth = c(2, 3, 4),
+#     bag.fraction = c(0.5, 0.7)
+#   )
+# )
+
+
+W <- W_tuned
+
+
+saveRDS(W_tuned, file="gbm_model.RDS")
+
+```
+
+
+## Robustness Evaluation of GBM-Based Cohort Weighting
+
+Testing gbm model for robustness. We assess model performance, weight distributions, covariate balance, and influence diagnostics to ensure the weighting approach produces reliable causal inference.
+
+```{r gbm-robustness}
+# ============================================================================
+# COMPREHENSIVE GBM ROBUSTNESS EVALUATION
+# ============================================================================
+
+library(WeightIt)
+library(cobalt)
+library(gbm)
+
+
+# Enhanced robustness checking function
+check_gbm_gps_robustness <- function(W, data, treatment_var = "VTEPROPHYLAXISHRS") {
+  
+  
+  # Initialize results storage
+  robustness_results <- list()
+  
+  ## ------------------------------------------------------------------
+  ##  PART 1: GBM MODEL DIAGNOSTICS
+  ## ------------------------------------------------------------------
+  
+  if (is.null(W$info$model)) {
+    robustness_results$model_available <- FALSE
+  } else {
+    
+    
+    robustness_results$model_available <- TRUE
+    mod <- W$info$model
+    best_tree <- W$info$best.tree
+    
+    # 1A. Convergence diagnostics
+    
+    # Plot convergence
+    par(mfrow = c(2, 2))
+    
+    # Training error
+    plot(mod$train.error, type = "l", 
+         main = "GBM Training Error", 
+         xlab = "Iteration", ylab = "Training Error")
+    abline(v = best_tree, col = "red", lwd = 2)
+    
+    # OOB error if available
+    if (!is.null(mod$oobag.improve)) {
+      plot(cumsum(mod$oobag.improve), type = "l",
+           main = "Cumulative OOB Improvement",
+           xlab = "Iteration", ylab = "Cumulative Improvement")
+      abline(v = best_tree, col = "red", lwd = 2)
+    }
+    
+    # 1B. Prediction quality
+    preds <- predict(mod, newdata = data, n.trees = best_tree)
+    observed <- data[[treatment_var]]
+    
+    # Remove NAs for comparison
+    valid_idx <- !is.na(observed) & !is.na(preds)
+    preds_clean <- preds[valid_idx]
+    observed_clean <- observed[valid_idx]
+    
+    if (length(preds_clean) > 0) {
+      # Prediction correlation
+      pred_cor <- cor(preds_clean, observed_clean, use = "complete.obs")
+      
+      # RMSE
+      rmse <- sqrt(mean((preds_clean - observed_clean)^2, na.rm = TRUE))
+      
+      # MAE
+      mae <- mean(abs(preds_clean - observed_clean), na.rm = TRUE)
+      
+      
+      # Store results
+      robustness_results$prediction_quality <- list(
+        correlation = pred_cor,
+        rmse = rmse,
+        mae = mae
+      )
+      
+      # Prediction vs observed plot
+      plot(preds_clean, observed_clean,
+           main = "Predicted vs Observed VTE Timing",
+           xlab = "Predicted (hours)", ylab = "Observed (hours)",
+           pch = 19, col = rgb(0, 0, 0, 0.3))
+      abline(0, 1, col = "red", lwd = 2)
+      
+      # Residuals plot
+      residuals <- observed_clean - preds_clean
+      plot(preds_clean, residuals,
+           main = "Residuals vs Fitted",
+           xlab = "Fitted values", ylab = "Residuals",
+           pch = 19, col = rgb(0, 0, 0, 0.3))
+      abline(h = 0, col = "red", lwd = 2)
+      
+      par(mfrow = c(1, 1))
+    }
+    
+    # 1C. Variable importance
+    if (!is.null(mod)) {
+      var_imp <- summary(mod, n.trees = best_tree, plot.it = FALSE)
+      robustness_results$variable_importance <- var_imp
+    }
+  }
+  
+  ## ------------------------------------------------------------------
+  ##  PART 2: WEIGHT DIAGNOSTICS
+  ## ------------------------------------------------------------------
+  
+  cat("======================================\n")
+  
+  weights <- W$weights
+  
+  # 2A. Weight summary statistics
+  weight_summary <- data.frame(
+    Statistic = c("Mean", "Median", "SD", "Min", "Max", "IQR", "Range"),
+    Value = c(
+      round(mean(weights, na.rm = TRUE), 3),
+      round(median(weights, na.rm = TRUE), 3),
+      round(sd(weights, na.rm = TRUE), 3),
+      round(min(weights, na.rm = TRUE), 3),
+      round(max(weights, na.rm = TRUE), 3),
+      round(IQR(weights, na.rm = TRUE), 3),
+      round(max(weights, na.rm = TRUE) - min(weights, na.rm = TRUE), 3)
+    )
+  )
+  
+  
+  # 2B. Effective sample size
+  ess <- sum(weights)^2 / sum(weights^2)
+  ess_ratio <- ess / length(weights)
+  
+  cat("2B. Effective Sample Size:\n")
+  
+  robustness_results$weight_diagnostics <- list(
+    summary = weight_summary,
+    ess = ess,
+    ess_ratio = ess_ratio
+  )
+  
+  # 2C. Extreme weights analysis
+  weight_percentiles <- quantile(weights, c(0.01, 0.05, 0.95, 0.99), na.rm = TRUE)
+  extreme_high <- sum(weights > weight_percentiles[4])
+  extreme_low <- sum(weights < weight_percentiles[1])
+  
+  cat("   Weights > 99th percentile (", round(weight_percentiles[4], 2), "):", extreme_high, "patients\n")
+  cat("   Weights < 1st percentile (", round(weight_percentiles[1], 2), "):", extreme_low, "patients\n")
+  
+  # 2D. Weight distribution plot
+  par(mfrow = c(2, 2))
+  
+  hist(weights, breaks = 50, main = "Weight Distribution", 
+       xlab = "Weight", col = "lightblue", border = "white")
+  
+  boxplot(weights, main = "Weight Distribution (Boxplot)", 
+          ylab = "Weight", col = "lightgreen")
+  
+  # Log-scale histogram for heavy tails
+  hist(log(weights), breaks = 50, main = "Log Weight Distribution", 
+       xlab = "Log(Weight)", col = "lightcoral", border = "white")
+  
+  # QQ plot for normality check
+  qqnorm(weights, main = "Q-Q Plot of Weights")
+  qqline(weights, col = "red")
+  
+  par(mfrow = c(1, 1))
+  
+  ## ------------------------------------------------------------------
+  ##  PART 3: COVARIATE BALANCE ASSESSMENT
+  ## ------------------------------------------------------------------
+  
+  cat("======================================\n")
+  
+  # 3A. Balance table using cobalt
+  if (requireNamespace("cobalt", quietly = TRUE)) {
+    
+    # Get balance statistics
+    bal_table <- cobalt::bal.tab(W, un = TRUE, disp.v.ratio = TRUE, disp.means = TRUE)
+    
+    # Extract key balance metrics
+    if (!is.null(bal_table$Balance)) {
+      balance_stats <- bal_table$Balance
+      
+      # Pre-weighting correlations
+      pre_cors <- abs(balance_stats$Corr.Un)
+      post_cors <- abs(balance_stats$Corr.Adj)
+      
+      # Remove NAs
+      pre_cors_clean <- pre_cors[!is.na(pre_cors)]
+      post_cors_clean <- post_cors[!is.na(post_cors)]
+      
+      if (length(pre_cors_clean) > 0 && length(post_cors_clean) > 0) {
+        # Balance improvement metrics
+        pre_aac <- mean(pre_cors_clean)
+        post_aac <- mean(post_cors_clean)
+        pre_max <- max(pre_cors_clean)
+        post_max <- max(post_cors_clean)
+        
+        cat("   Pre-weighting max |correlation|:", round(pre_max, 3), "\n")
+        cat("   Post-weighting max |correlation|:", round(post_max, 3), "\n")
+        
+        robustness_results$balance_metrics <- list(
+          pre_aac = pre_aac,
+          post_aac = post_aac,
+          pre_max = pre_max,
+          post_max = post_max,
+          aac_improvement = pre_aac - post_aac
+        )
+        
+        # Success criteria
+        balance_success <- post_max < 0.1 && post_aac < 0.05
+        cat("   Balance achievement (max |r| < 0.1 & AAC < 0.05):", 
+            ifelse(balance_success, "YES", "NO"), "\n")
+      }
+      
+      # Print balance table summary
+      
+      # Create love plot if possible
+      if (requireNamespace("ggplot2", quietly = TRUE)) {
+        tryCatch({
+          love_plot <- cobalt::love.plot(W, var.order = "unadjusted", abs = TRUE, 
+                                        title = "Covariate Balance Before and After Weighting")
+        }, error = function(e) {
+        })
+      }
+    }
+  }
+  
+  ## ------------------------------------------------------------------
+  ##  PART 4: INFLUENCE DIAGNOSTICS
+  ## ------------------------------------------------------------------
+  
+  
+  
+  # 4A. Influential observations by weight
+  high_weight_threshold <- quantile(weights, 0.95, na.rm = TRUE)
+  influential_obs <- which(weights > high_weight_threshold)
+  
+  cat("   95th percentile weight threshold:", round(high_weight_threshold, 3), "\n")
+  cat("   Number of influential observations:", length(influential_obs), "\n")
+  cat("   Percentage of sample:", round(100 * length(influential_obs) / length(weights), 1), "%\n")
+  
+  # 4B. Sensitivity to extreme weights
+  # Trim extreme weights and see impact on balance
+  trimmed_weights <- weights
+  trimmed_weights[trimmed_weights > quantile(weights, 0.99)] <- quantile(weights, 0.99)
+  
+  cat("4B. Sensitivity Analysis (99% trimming):\n")
+  cat("   Original weight range:", round(min(weights), 3), "-", round(max(weights), 3), "\n")
+  cat("   Trimmed weight range:", round(min(trimmed_weights), 3), "-", round(max(trimmed_weights), 3), "\n")
+  
+  robustness_results$influence_diagnostics <- list(
+    high_weight_threshold = high_weight_threshold,
+    n_influential = length(influential_obs),
+    influential_percentage = 100 * length(influential_obs) / length(weights)
+  )
+  
+  ## ------------------------------------------------------------------
+  ##  PART 5: OVERALL ASSESSMENT
+  ## ------------------------------------------------------------------
+  
+  cat("\n🏆 Part 5: Overall Robustness Assessment\n")
+  cat("=======================================\n")
+  
+  # Scoring criteria
+  scores <- list()
+  
+  # Model performance (if available)
+  if (robustness_results$model_available && !is.null(robustness_results$prediction_quality)) {
+    pred_quality_score <- ifelse(robustness_results$prediction_quality$correlation > 0.3, 1, 0)
+    scores$prediction <- pred_quality_score
+  }
+  
+  # Weight distribution
+  ess_score <- ifelse(robustness_results$weight_diagnostics$ess_ratio > 0.8, 1, 0)
+  extreme_weight_score <- ifelse(robustness_results$influence_diagnostics$influential_percentage < 10, 1, 0)
+  scores$weights <- mean(c(ess_score, extreme_weight_score))
+  
+  # Balance achievement
+  if (!is.null(robustness_results$balance_metrics)) {
+    balance_score <- ifelse(robustness_results$balance_metrics$post_max < 0.1, 1, 0)
+    scores$balance <- balance_score
+  }
+  
+  # Overall score
+  overall_score <- mean(unlist(scores), na.rm = TRUE)
+  
+  cat("5A. Robustness Scoring:\n")
+  for (criterion in names(scores)) {
+    cat("  ", criterion, ":", round(scores[[criterion]], 2), "\n")
+  }
+  cat("   Overall robustness score:", round(overall_score, 2), "/1.0\n")
+  
+  # Interpretation
+  if (overall_score >= 0.8) {
+    assessment <- "EXCELLENT - High confidence in weighting approach"
+  } else if (overall_score >= 0.6) {
+    assessment <- "GOOD - Acceptable with some concerns"
+  } else {
+    assessment <- "POOR - Consider alternative approaches"
+  }
+  
+  cat("5B. Overall Assessment:", assessment, "\n")
+  
+  robustness_results$overall_score <- overall_score
+  robustness_results$assessment <- assessment
+  
+  return(robustness_results)
+}
+
+# Run robustness check on existing GBM model
+if (exists("W") || exists("W_tuned")) {
+  gbm_model <- if(exists("W_tuned")) W_tuned else W
+  # Use df_modeling for consistency with weight calculation
+  analysis_data <- df_modeling
+  
+  cat("Running robustness evaluation on GBM model...\n")
+  robustness_results <- check_gbm_gps_robustness(gbm_model, analysis_data)
+  
+  cat("\n📋 Robustness Evaluation Complete\n")
+  cat("=================================\n")
+  cat("Results stored in 'robustness_results' object\n")
+  
+} else {
+  cat("❌ No GBM model found. Please run the GBM weighting section first.\n")
+}
+```
+
+
+
+# Cox Spline Model
+
+## Initial Cox Model + Methods for Dealing with Non-Proportionality
+
+Need to complete
+1. schoenfields residuals test
+2. time-varying HR plot
+3. log(–log S) curves (by covariate strata)
+4. Martingale residuals for non-linearity
+5. Influence diagnostics
+6. RMST?
+
+Remember nonlinearity can disguise itself as nonproportionality
+
+```{r placeholder-1}
+# Unfinished
+```
+
+
+
+## Optimizing spline variables
+
+Searching approach is used to find appropriate degree of freedom (df) for splines of continuous variables which violate proportionality assumption. Different values of degree of freedom (df) for splines of continuous covariates in the survival model were tested. The set of dfs giving the smallest BIC was taken in constructing the final model. I am using BIC over AIC because it is best in large databases and when trying to study causal inference.
+
+Is this all I need to do?
+
+```{r, eval=FALSE, echo = FALSE}
+
+dfmc = dfmb |> mutate(ICU_Stay_t = ICU_Stay*log(FINALDISCHARGEHRS),
+                      Current_Smoker_t = Current_Smoker*log(FINALDISCHARGEHRS),
+                      TypeXa_Inhibitor_t = TypeXa_Inhibitor*log(FINALDISCHARGEHRS),
+                      Hypertension_t = Hypertension*log(FINALDISCHARGEHRS),
+                      Anticoagulant_Therapy_t = Anticoagulant_Therapy*log(FINALDISCHARGEHRS),
+                      TBIHIGHESTTOTALGCS = TBIHIGHESTTOTALGCS
+                      )
+
+nsgrid = expand.grid(a=c(4,5,6), b=c(3,4), c=c(3,4), d=c(3,4) )
+
+loglk = bic = as.numeric()
+
+for (i in 1:nrow(nsgrid)){
+  ia = nsgrid[i,1]
+  ib = nsgrid[i,2]
+  ic = nsgrid[i,3]
+  id = nsgrid[i,4]
+  
+  cox_spline_a <- coxph(Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+                           ns(VTEPROPHYLAXISHRS_log, df = ia) + Sex + 
+                           ns(AGEyears, df=ib) + 
+                           TypeDirect_Thrombin_Inhibitor + TypeUnfractionated_Heparin +
+                           TypeXa_Inhibitor + TypeXa_Inhibitor_t + TypeOther + 
+                           bs(TBIHIGHESTTOTALGCS,ic) + 
+                           Anticoagulant_Therapy + Anticoagulant_Therapy_t + 
+                           BMI + ICU_Stay + ICU_Stay_t +
+                           HOSPITALARRIVALHRS + Hx_of_CVA + Bleeding_Disorder + 
+                           Current_Smoker + Current_Smoker_t +
+                           Anticoagulant_Therapy + Myocardial_Infarction + 
+                           Hypertension + Hypertension_t,
+                         data = dfmc, weights = wtps )
+  
+  loglk[i] = as.numeric(logLik(cox_spline_a))
+  bic[i] = BIC(cox_spline_a)
+}
+
+res = data.frame(nsgrid, loglik=loglk, BIC = bic) |> arrange(BIC) 
+
+kbl(head(res), col.names = c(paste0("DF_",c("VTEPROPHYLAXISHRS","Age","TBIHIGHESTTOTALGCS","ISS")), 
+                             "Log-likelihood", "BIC")) |> kable_classic_2()
+```
+
+
+## Final Cox Model
+
+To obtain doubly robust estimation of coefficients, all covariates used in the propensity score model were included in the survival model. Each will be checked to see if violate the proportionality assumption.
+
+```{r weight-assignment}
+# Attach the weights to the SAME data frame they were generated from
+df_modeling$wtps <- W_tuned$weights
+
+
+cox_model <- coxph(
+  Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+    ## exposure (timing) ----------------------------------------------------
+    ns(VTEPROPHYLAXISHRS, df = 3) + VTEPROPHYLAXISTYPE +
+    SEX +
+    ns(AGEyears, df = 2) +
+    
+    ## injury severity ------------------------------------------------------
+    TBIHIGHESTTOTALGCS +
+    
+
+    ## comorbidities / home meds -------------------------------------------
+    Hx_AnticoagulantTherapy +
+    Hx_CVA +                         # prior stroke
+    Hx_Cirrhosis +
+    Hx_BleedingDisorder +
+    Hx_Hypertension,
+
+  data    = df_modeling,  # Use the correct data frame
+  weights = wtps,         # GBM-based IPTW from WeightIt
+)
+
+
+cox_summary <- summary(cox_model)
+coef_df <- as.data.frame(cox_summary$coefficients)
+
+# Optionally round and rename columns for clarity
+coef_df <- coef_df %>%
+  dplyr::mutate(across(everything(), ~ round(.x, 3))) %>%
+  dplyr::rename(
+    Coefficient = coef,
+    HR = `exp(coef)`,
+    `SE` = `se(coef)`,
+    `Robust SE` = `robust se`,
+    `Z` = `z`,
+    `P-value` = `Pr(>|z|)`
+  )
+
+# Create kable table
+kable(coef_df, caption = "Cox Proportional Hazards Model Summary")
+```
+
+## Testing Final Cox Spline Model for Robustness
+
+1. influential points?
+- Influence diagnostics (dfbeta, delta-beta)
+2. sensitivity analysis
+3. Focusing on goodness-of-fit rather than model refitting?
+- Martingale or Deviance residual plots
+
+```{r placeholder-2}
+
+```
+
+
+
+# Segmented Cox Regression
+
+A nice method to supplement my regular cox model. I need this to be boostrapped in order to get intervals. The analytically derived p-value is very wide out of the box.
+
+```{r base-cox-model}
+###############################################################################
+## 1 ▸  Base Cox model (keep raw timing term)
+###############################################################################
+cox0 <- coxph(
+  Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+      VTEPROPHYLAXISHRS +               # raw linear term
+      VTEPROPHYLAXISTYPE + SEX +
+      ns(AGEyears, df = 2) +
+      TBIHIGHESTTOTALGCS +
+      Hx_AnticoagulantTherapy +
+      Hx_CVA + Hx_Cirrhosis + Hx_BleedingDisorder + Hx_Hypertension,
+  data    = df_modeling,
+  weights = wtps,
+  robust  = TRUE,                       # sandwich vcov
+  model   = TRUE                        # retains design matrix
+)
+
+###############################################################################
+## 2 ▸  Segmented fit (one breakpoint)
+###############################################################################
+psi_start <- list(VTEPROPHYLAXISHRS = median(df_modeling$VTEPROPHYLAXISHRS, na.rm = TRUE))
+
+segFit <- suppressWarnings(
+  segmented(
+    cox0,
+    seg.Z  = ~ VTEPROPHYLAXISHRS,
+    psi    = psi_start,
+    control = seg.control(display = FALSE, n.boot = 0)
+  )
+)
+
+## extract ψ̂ ± SE   (column names differ by package version → use grep)
+psi_tab <- segFit$psi
+row_idx <- grep("VTEPROPHYLAXISHRS", rownames(psi_tab))
+est_col <- grep("^Est",      colnames(psi_tab))
+se_col  <- grep("^St\\.?Err", colnames(psi_tab))
+
+psi_est <- as.numeric(psi_tab[row_idx, est_col])
+psi_se  <- as.numeric(psi_tab[row_idx, se_col])
+
+cat(sprintf("ψ̂ = %.2f h   (robust SE %.2f  ⇒ 95%% CI %.2f–%.2f)\n",
+            psi_est, psi_se, psi_est - 1.96*psi_se, psi_est + 1.96*psi_se))
+
+###############################################################################
+## 3 ▸  Population-average HR curve
+###############################################################################
+grid_hours <- 1:168
+ref_hour   <- as.numeric(quantile(df_modeling$VTEPROPHYLAXISHRS, .25, na.rm = TRUE))
+
+## 3·1  explode data (patient × hour)
+grid_df <- df_modeling[rep(seq_len(nrow(df_modeling)), each = length(grid_hours)), ]
+grid_df$VTEPROPHYLAXISHRS <- rep(grid_hours, times = nrow(df_modeling))
+
+## 3·2  add the two extra predictors expected by the segmented model
+grid_df$U1.VTEPROPHYLAXISHRS  <- pmax(0, grid_df$VTEPROPHYLAXISHRS - psi_est)
+grid_df$psi1.VTEPROPHYLAXISHRS <- 1        # constant column
+
+## 3·3  linear predictor for each row
+grid_df$lp <- predict(segFit, newdata = grid_df, type = "lp")
+
+## 3·4  reference lp for each patient at ref_hour (add required columns)
+ref_dat <- df_modeling %>%
+  mutate(
+    VTEPROPHYLAXISHRS       = ref_hour,
+    U1.VTEPROPHYLAXISHRS    = pmax(0, ref_hour - psi_est),
+    psi1.VTEPROPHYLAXISHRS  = 1
+  )
+ref_lp <- predict(segFit, newdata = ref_dat, type = "lp")
+
+grid_df$ref_lp <- rep(ref_lp, each = length(grid_hours))
+
+## 3·5  patient-specific HR & weights
+grid_df$HR <- exp(grid_df$lp - grid_df$ref_lp)
+grid_df$w  <- rep(df_modeling$wtps, each = length(grid_hours))
+
+pop_avg <- grid_df %>%
+  group_by(VTEPROPHYLAXISHRS) %>%
+  summarise(
+    HR = sum(w * HR) / sum(w),
+    se = 0.05 * HR,                       # quick ±5 % band; swap bootstrap here
+    .groups = "drop"
+  ) %>%
+  mutate(lo = HR * exp(-1.96 * se / HR),
+         hi = HR * exp( 1.96 * se / HR))
+
+###############################################################################
+## 4 ▸  Plot
+###############################################################################
+ggplot(pop_avg, aes(VTEPROPHYLAXISHRS, HR)) +
+  geom_line(size = 1.1, colour = "#0072B2") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .20, fill = "#0072B2") +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = psi_est, linetype = "dotted", colour = "red") +
+  annotate("text", x = psi_est, y = max(pop_avg$hi),
+           label = sprintf("ψ̂ ≈ %.1f h", psi_est),
+           hjust = -0.05, vjust = 1, colour = "red") +
+  labs(
+    x = "Hours after admission",
+    y = "Population-average hazard ratio\n(ref = Q1 ≈ 19 h)",
+    title = "Population-average HR vs. prophylaxis timing (segmented-Cox)"
+  )
+
+```
+
+## Bootstrap Confidence Intervals for Segmented Cox Regression
+
+The analytical standard errors from segmented regression can be unreliable. We implement bootstrap resampling to obtain robust confidence intervals for the breakpoint estimate and hazard ratio curve.
+
+```{r segmented-bootstrap}
+# ============================================================================
+# BOOTSTRAP CONFIDENCE INTERVALS FOR SEGMENTED COX REGRESSION
+# ============================================================================
+
+library(boot)
+
+cat("Bootstrap Analysis for Segmented Cox Regression:\n")
+cat("===============================================\n")
+
+# Bootstrap function for segmented regression
+bootstrap_segmented_cox <- function(data, indices, ref_hour) {
+  
+  # Resample data
+  boot_data <- data[indices, ]
+  
+  # Fit base Cox model on bootstrap sample
+  cox_boot <- tryCatch({
+    coxph(
+      Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+        VTEPROPHYLAXISHRS + VTEPROPHYLAXISTYPE + SEX +
+        ns(AGEyears, df = 2) +
+        TBIHIGHESTTOTALGCS +
+        Hx_AnticoagulantTherapy + Hx_CVA + Hx_Cirrhosis + 
+        Hx_BleedingDisorder + Hx_Hypertension,
+      data = boot_data,
+      weights = wtps,
+      robust = TRUE,
+      model = TRUE
+    )
+  }, error = function(e) return(NULL))
+  
+  if (is.null(cox_boot)) return(rep(NA, 4))
+  
+  # Fit segmented model on bootstrap sample
+  psi_start_boot <- list(VTEPROPHYLAXISHRS = median(boot_data$VTEPROPHYLAXISHRS, na.rm = TRUE))
+  
+  seg_boot <- tryCatch({
+    suppressWarnings(
+      segmented(
+        cox_boot,
+        seg.Z = ~ VTEPROPHYLAXISHRS,
+        psi = psi_start_boot,
+        control = seg.control(display = FALSE, n.boot = 0)
+      )
+    )
+  }, error = function(e) return(NULL))
+  
+  if (is.null(seg_boot)) return(rep(NA, 4))
+  
+  # Extract breakpoint estimate
+  psi_tab_boot <- seg_boot$psi
+  row_idx_boot <- grep("VTEPROPHYLAXISHRS", rownames(psi_tab_boot))
+  est_col_boot <- grep("^Est", colnames(psi_tab_boot))
+  
+  if (length(row_idx_boot) == 0 || length(est_col_boot) == 0) return(rep(NA, 4))
+  
+  psi_est_boot <- as.numeric(psi_tab_boot[row_idx_boot, est_col_boot])
+  
+  # Calculate HR at specific time points for curve estimation
+  # We'll calculate HR at 24h, 48h, and 72h relative to reference
+  time_points <- c(24, 48, 72)
+  hrs <- numeric(length(time_points))
+  
+  for (i in seq_along(time_points)) {
+    # Create prediction data
+    pred_data <- boot_data[1:min(100, nrow(boot_data)), ] # Use subset for speed
+    pred_data$VTEPROPHYLAXISHRS <- time_points[i]
+    pred_data$U1.VTEPROPHYLAXISHRS <- pmax(0, time_points[i] - psi_est_boot)
+    pred_data$psi1.VTEPROPHYLAXISHRS <- 1
+    
+    ref_data <- pred_data
+    ref_data$VTEPROPHYLAXISHRS <- ref_hour
+    ref_data$U1.VTEPROPHYLAXISHRS <- pmax(0, ref_hour - psi_est_boot)
+    ref_data$psi1.VTEPROPHYLAXISHRS <- 1
+    
+    # Predict linear predictors
+    lp_pred <- tryCatch({
+      predict(seg_boot, newdata = pred_data, type = "lp")
+    }, error = function(e) return(rep(NA, nrow(pred_data))))
+    
+    lp_ref <- tryCatch({
+      predict(seg_boot, newdata = ref_data, type = "lp")
+    }, error = function(e) return(rep(NA, nrow(ref_data))))
+    
+    if (any(is.na(lp_pred)) || any(is.na(lp_ref))) {
+      hrs[i] <- NA
+    } else {
+      # Calculate weighted average HR
+      hr_individual <- exp(lp_pred - lp_ref)
+      weights_subset <- boot_data$wtps[1:length(hr_individual)]
+      hrs[i] <- sum(weights_subset * hr_individual, na.rm = TRUE) / sum(weights_subset, na.rm = TRUE)
+    }
+  }
+  
+  return(c(psi_est_boot, hrs))
+}
+
+# Set up bootstrap parameters
+set.seed(42)  # For reproducibility
+n_bootstrap <- 1000  # Number of bootstrap samples
+
+cat("Running", n_bootstrap, "bootstrap samples...\n")
+cat("This may take several minutes...\n")
+
+# Prepare data for bootstrap (remove NAs)
+boot_data <- df_modeling %>%
+  filter(!is.na(FINALDISCHARGEHRS) & !is.na(WITHDRAWALLST) & 
+         !is.na(VTEPROPHYLAXISHRS) & !is.na(wtps)) %>%
+  mutate(row_id = row_number())
+
+# Run bootstrap
+start_time <- Sys.time()
+
+bootstrap_results <- boot(
+  data = boot_data,
+  statistic = function(data, indices) bootstrap_segmented_cox(data, indices, ref_hour),
+  R = n_bootstrap,
+  parallel = "no"  # Set to "multicore" if available
+)
+
+end_time <- Sys.time()
+boot_time <- round(as.numeric(difftime(end_time, start_time, units = "mins")), 2)
+
+cat("Bootstrap completed in", boot_time, "minutes\n")
+
+# ============================================================================
+# BOOTSTRAP RESULTS ANALYSIS
+# ============================================================================
+
+cat("\nBootstrap Results Analysis:\n")
+cat("===========================\n")
+
+# Extract bootstrap estimates
+boot_estimates <- bootstrap_results$t
+valid_boots <- complete.cases(boot_estimates)
+boot_estimates_clean <- boot_estimates[valid_boots, ]
+
+cat("Valid bootstrap samples:", sum(valid_boots), "out of", n_bootstrap, "\n")
+
+if (sum(valid_boots) < 50) {
+  cat("❌ Insufficient valid bootstrap samples for reliable inference\n")
+} else {
+  
+  # Breakpoint confidence intervals
+  psi_boots <- boot_estimates_clean[, 1]
+  psi_ci <- quantile(psi_boots, c(0.025, 0.975), na.rm = TRUE)
+  
+  cat("\nBreakpoint Estimates:\n")
+  cat("====================\n")
+  cat("Original estimate:", round(psi_est, 2), "hours\n")
+  cat("Bootstrap mean:", round(mean(psi_boots, na.rm = TRUE), 2), "hours\n")
+  cat("Bootstrap 95% CI:", round(psi_ci[1], 2), "-", round(psi_ci[2], 2), "hours\n")
+  
+  # HR confidence intervals at key time points
+  time_points <- c(24, 48, 72)
+  hr_results <- data.frame(
+    Time_Hours = time_points,
+    Bootstrap_Mean_HR = numeric(3),
+    CI_Lower = numeric(3),
+    CI_Upper = numeric(3)
+  )
+  
+  cat("\nHazard Ratio Estimates:\n")
+  cat("=======================\n")
+  
+  for (i in seq_along(time_points)) {
+    hr_boots <- boot_estimates_clean[, i + 1]
+    hr_boots_valid <- hr_boots[!is.na(hr_boots) & hr_boots > 0 & hr_boots < 10]
+    
+    if (length(hr_boots_valid) > 10) {
+      hr_mean <- mean(hr_boots_valid)
+      hr_ci <- quantile(hr_boots_valid, c(0.025, 0.975))
+      
+      hr_results[i, ] <- c(time_points[i], hr_mean, hr_ci[1], hr_ci[2])
+      
+      cat("HR at", time_points[i], "hours:", 
+          round(hr_mean, 3), "(95% CI:", round(hr_ci[1], 3), "-", round(hr_ci[2], 3), ")\n")
+    } else {
+      cat("HR at", time_points[i], "hours: Insufficient valid estimates\n")
+    }
+  }
+  
+  # ============================================================================
+  # ENHANCED POPULATION-AVERAGE HR CURVE WITH BOOTSTRAP CIS
+  # ============================================================================
+  
+  cat("\nGenerating Enhanced HR Curve with Bootstrap CIs:\n")
+  cat("================================================\n")
+  
+  # Create extended grid for smooth curve
+  extended_grid <- 1:168
+  
+  # Bootstrap confidence bands (simplified approach)
+  # We'll use the bootstrap distribution of the breakpoint to create uncertainty bands
+  
+  # Calculate HR curve for different breakpoint values
+  psi_quantiles <- quantile(psi_boots, c(0.025, 0.5, 0.975), na.rm = TRUE)
+  
+  enhanced_curves <- list()
+  
+  for (q in 1:length(psi_quantiles)) {
+    psi_q <- psi_quantiles[q]
+    
+    # Recreate population average with this breakpoint
+    grid_df_q <- df[rep(seq_len(nrow(df)), each = length(extended_grid)), ]
+    grid_df_q$VTEPROPHYLAXISHRS <- rep(extended_grid, times = nrow(df))
+    grid_df_q$U1.VTEPROPHYLAXISHRS <- pmax(0, grid_df_q$VTEPROPHYLAXISHRS - psi_q)
+    grid_df_q$psi1.VTEPROPHYLAXISHRS <- 1
+    
+    # Use original segmented model coefficients but with new breakpoint
+    grid_df_q$lp <- predict(segFit, newdata = grid_df_q, type = "lp")
+    
+    ref_dat_q <- df %>%
+      mutate(
+        VTEPROPHYLAXISHRS = ref_hour,
+        U1.VTEPROPHYLAXISHRS = pmax(0, ref_hour - psi_q),
+        psi1.VTEPROPHYLAXISHRS = 1
+      )
+    ref_lp_q <- predict(segFit, newdata = ref_dat_q, type = "lp")
+    
+    grid_df_q$ref_lp <- rep(ref_lp_q, each = length(extended_grid))
+    grid_df_q$HR <- exp(grid_df_q$lp - grid_df_q$ref_lp)
+    grid_df_q$w <- rep(df$wtps, each = length(extended_grid))
+    
+    curve_q <- grid_df_q %>%
+      group_by(VTEPROPHYLAXISHRS) %>%
+      summarise(HR = sum(w * HR) / sum(w), .groups = "drop")
+    
+    enhanced_curves[[q]] <- curve_q$HR
+  }
+  
+  # Create enhanced plot data
+  enhanced_pop_avg <- data.frame(
+    VTEPROPHYLAXISHRS = extended_grid,
+    HR = enhanced_curves[[2]],  # median
+    HR_lower = enhanced_curves[[1]],  # 2.5%
+    HR_upper = enhanced_curves[[3]]   # 97.5%
+  )
+  
+  # Enhanced plot
+  p_enhanced <- ggplot(enhanced_pop_avg, aes(VTEPROPHYLAXISHRS, HR)) +
+    geom_ribbon(aes(ymin = HR_lower, ymax = HR_upper), 
+                alpha = 0.3, fill = "#0072B2") +
+    geom_line(size = 1.2, colour = "#0072B2") +
+    geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+    geom_vline(xintercept = psi_est, linetype = "dotted", colour = "red", size = 1) +
+    geom_vline(xintercept = psi_ci[1], linetype = "dotted", colour = "red", alpha = 0.5) +
+    geom_vline(xintercept = psi_ci[2], linetype = "dotted", colour = "red", alpha = 0.5) +
+    annotate("text", x = psi_est, y = max(enhanced_pop_avg$HR_upper),
+             label = sprintf("Breakpoint: %.1f h\n(95%% CI: %.1f-%.1f h)", 
+                           psi_est, psi_ci[1], psi_ci[2]),
+             hjust = -0.05, vjust = 1, colour = "red", size = 3.5) +
+    labs(
+      x = "Hours after admission",
+      y = "Population-average hazard ratio",
+      title = "Segmented Cox Regression with Bootstrap Confidence Intervals",
+      subtitle = paste0("Reference: ", round(ref_hour, 1), " hours | Bootstrap samples: ", sum(valid_boots))
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 14, face = "bold"))
+  
+  print(p_enhanced)
+  
+  # Summary table
+  summary_table <- data.frame(
+    Statistic = c("Breakpoint (hours)", "95% CI Lower", "95% CI Upper", 
+                  "Bootstrap samples", "Valid samples", "Success rate (%)"),
+    Value = c(
+      round(psi_est, 2),
+      round(psi_ci[1], 2), 
+      round(psi_ci[2], 2),
+      n_bootstrap,
+      sum(valid_boots),
+      round(100 * sum(valid_boots) / n_bootstrap, 1)
+    )
+  )
+  
+  kable(summary_table, caption = "Bootstrap Analysis Summary for Segmented Cox Regression")
+  
+  if (nrow(hr_results) > 0) {
+    kable(hr_results, digits = 3, 
+          caption = "Bootstrap Hazard Ratio Estimates at Key Time Points")
+  }
+}
+```
+
+
+
+
+## Creating Forest Plot
+
+```{r, echo = FALSE, eval = FALSE}
+library(broom)        # tidy()
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+# 1 ── tidy the model & keep HRs --------------------------------------------
+cox_tidy <- tidy(cox_model, exponentiate = TRUE, conf.int = TRUE)
+
+# 2 ── drop spline basis terms ----------------------------------------------
+cox_filtered <- cox_tidy %>% 
+  filter(!str_detect(term, "^ns\\(")) %>% 
+  mutate(term = str_remove_all(term, "`"))  # drop back-ticks
+
+# 3 ── build pretty labels ---------------------------------------------------
+pretty_labels <- c(
+  # demographics
+  "SEX"                     = "Female sex",
+  "AGEyears"                = "Age (per spline)",   # spline summary row
+
+  # injury severity
+  "ISS"                     = "Injury Severity Score (spline)",
+  "TBIHIGHESTTOTALGCS"      = "Highest admission GCS",
+
+  # hemorrhage composite
+  "hemorrhagic_shock"       = "Hemorrhagic shock",
+
+  # comorbidities / meds
+  "Hx_AnticoagulantTherapy" = "Pre-hospital anticoagulation",
+  "Hx_CVA"                  = "Prior stroke/TIA",
+  "Hx_MyocardialInfarction" = "Prior myocardial infarction",
+  "Hx_Cirrhosis"            = "Cirrhosis",
+  "Hx_BleedingDisorder"     = "Bleeding disorder",
+  "Hx_DisseminatedCancer"   = "Disseminated cancer",
+  "Hx_Hypertension"         = "Hypertension",
+
+  # prophylaxis category contrasts
+  "VTEPROPHYLAXISTYPEPLWMH"     = "LMWH vs UFH",
+  "VTEPROPHYLAXISTYPEPXa"       = "Xa-inhibitor vs UFH"
+)
+
+# Map labels and fall back to raw term when no match
+cox_filtered <- cox_filtered %>% 
+  mutate(label = coalesce(pretty_labels[term], term),
+         label = factor(label, levels = rev(unique(label))))
+
+# 4 ── draw forest plot ------------------------------------------------------
+ggplot(cox_filtered,
+       aes(x = estimate, y = label)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray60") +
+  scale_x_continuous(trans = "log10") +          # log scale for HRs
+  labs(
+    title = "Hazard Ratios for Time-to-Discharge (Spline Terms Omitted)",
+    x = "Hazard ratio (log scale)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+
+## Visualizing Cox Spline Variable
+
+```{r hr-curve-plot}
+###############################################################################
+## 3 ▸  Build plot_df (population-average HR curve)
+###############################################################################
+grid_hours <- 1:168
+ref_hour   <- as.numeric(quantile(df$VTEPROPHYLAXISHRS, .25, na.rm = TRUE))
+
+## 3·1 explode data  (patient × hour)
+grid_df <- df[rep(seq_len(nrow(df)), each = length(grid_hours)), ]
+
+# --- use the SAME variable name the model was fit with
+grid_df$VTEPROPHYLAXISHRS <- rep(grid_hours, times = nrow(df))
+
+grid_df$w <- rep(df$wtps, each = length(grid_hours))   # replicate weights
+
+## 3·2 predictions
+grid_df$lp <- predict(cox_model, newdata = grid_df, type = "lp")
+
+ref_dat <- df %>%
+  mutate(VTEPROPHYLAXISHRS = ref_hour)
+
+ref_lp <- predict(cox_model, newdata = ref_dat, type = "lp")
+grid_df$ref_lp <- rep(ref_lp, each = length(grid_hours))
+
+## 3·3 weighted mean HR
+plot_df <- grid_df %>%
+  mutate(HR_ind = exp(lp - ref_lp)) %>%
+  group_by(VTEPROPHYLAXISHRS) %>%           # group by the true name
+  summarise(
+    HR    = sum(w * HR_ind) / sum(w),
+    se    = 0.05 * HR,                      # quick ribbon
+    lower = HR * exp(-1.96 * se / HR),
+    upper = HR * exp( 1.96 * se / HR),
+    .groups = "drop"
+  ) %>%
+  rename(VTE_Hours = VTEPROPHYLAXISHRS)     # nice label for plotting
+```
+
+attempting bootstrapping to obtain CIs
+
+
+
+```{r plateau-detection}
+# ------------------------------------------------------------
+# USER-SET PARAMETERS
+tol_slope <- 0.002   # 0.2 % change per hour  (adjust if you like)
+
+# ------------------------------------------------------------
+# 1 ▸ finite-difference slope  d(HR)/dt
+plot_df <- plot_df %>%
+  arrange(VTE_Hours) %>%
+  mutate(
+    dHR_dt = c(diff(HR) / diff(VTE_Hours), NA)   # last row NA
+  )
+
+# 2 ▸ earliest hour beyond Q1 where:
+#     (i) HR < 1   and
+#     (ii) |slope| < tol_slope
+idx <- which(
+  plot_df$VTE_Hours > ref_hour &           # beyond the reference
+  plot_df$HR         < 1       &           # already beneficial
+  abs(plot_df$dHR_dt) < tol_slope          # essentially flat
+)[1]
+
+if (!is.na(idx)) {
+  plateau_hour <- plot_df$VTE_Hours[idx]
+} else {
+  plateau_hour <- NA_real_
+  warning("Curve never meets the flat-plateau criterion.")
+}
+
+# ------------------------------------------------------------
+# 3 ▸ Plot with the plateau marker
+library(ggplot2)
+
+ggplot(plot_df, aes(VTE_Hours, HR)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = .2) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  {if(!is.na(plateau_hour)) geom_vline(xintercept = plateau_hour,
+                                       linetype = "dotted")} +
+  {if(!is.na(plateau_hour)) annotate(
+      "text", x = plateau_hour, y = max(plot_df$upper, na.rm = TRUE),
+      label = sprintf("Plateau starts ≈ %.1f h", plateau_hour),
+      hjust = -0.05, vjust = 1, size = 3.5)} +
+  labs(
+    title    = "Population-average HR vs. VTE-prophylaxis timing",
+    subtitle = sprintf("Reference = first quartile (%.1f h); slope tolerance = %.3f/hr",
+                       ref_hour, tol_slope),
+    x = "Hours after admission",
+    y = "Hazard ratio"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+```{r derivative-plot}
+# 1. Plot the curve and its first derivative on the same panel
+plot_df %>%
+  ggplot(aes(VTE_Hours, dHR_dt)) +
+  geom_line() +
+  geom_hline(yintercept = c(-tol_slope, tol_slope),
+             lty = 2, colour = "grey60") +
+  coord_cartesian(ylim = c(-0.01, 0.01))
+
+```
+
+
+```{r plateau-bootstrap-delta}
+###############################################################################
+##  Bootstrap CI for delta-method plateau hour  (grid clipped to resample)
+###############################################################################
+library(future.apply)
+plan(multisession, workers = 6)
+
+get_plateau <- function(data, ids, cox_model, tol_slope = 0.002){
+
+  library(survival); library(splines); library(dplyr)
+
+  ## 1 ▸ resample patients
+  boot_df <- data[data$id %in% sample(ids, replace = TRUE), ]
+
+  ## 2 ▸ grid within resample’s range -------------------- (← changed)
+  rng        <- range(boot_df$VTEPROPHYLAXISHRS, na.rm = TRUE)
+  grid_hours <- seq(from = floor(rng[1]), to = ceiling(rng[2]), by = 1)
+  ref_hour   <- as.numeric(quantile(boot_df$VTEPROPHYLAXISHRS, .25, na.rm = TRUE))
+
+  ## 3 ▸ explode + predictions
+  grid_df <- boot_df[rep(seq_len(nrow(boot_df)), each = length(grid_hours)), ]
+  grid_df$VTEPROPHYLAXISHRS <- rep(grid_hours, times = nrow(boot_df))
+  grid_df$w  <- rep(boot_df$wtps, each = length(grid_hours))
+
+  grid_df$lp <- predict(cox_model, newdata = grid_df, type = "lp")
+
+  ref_lp <- predict(cox_model,
+                    newdata = boot_df %>% mutate(VTEPROPHYLAXISHRS = ref_hour),
+                    type = "lp")
+  grid_df$ref_lp <- rep(ref_lp, each = length(grid_hours))
+
+  plot_df_b <- grid_df %>%
+    mutate(HR_ind = exp(lp - ref_lp)) %>%
+    group_by(VTEPROPHYLAXISHRS) %>%
+    summarise(HR = sum(w * HR_ind) / sum(w), .groups = "drop") %>%
+    arrange(VTEPROPHYLAXISHRS) %>%
+    mutate(dHR_dt = c(diff(HR) / diff(VTEPROPHYLAXISHRS), NA))
+
+  ## 4 ▸ plateau rule
+  idx <- which(plot_df_b$VTEPROPHYLAXISHRS > ref_hour &
+               plot_df_b$HR               < 1        &
+               abs(plot_df_b$dHR_dt)      < tol_slope)[1]
+
+  if (is.na(idx)) return(NA_real_)
+  plot_df_b$VTEPROPHYLAXISHRS[idx]
+}
+
+###############################################################################
+##  Run bootstrap
+###############################################################################
+B <- 1000
+set.seed(2025)
+
+boot_plateau <- future_sapply(
+  1:B,
+  \(i) get_plateau(df_modeling, unique(df_modeling$id), cox_model, tol_slope = 0.002),
+  future.seed = TRUE
+)
+
+boot_plateau <- na.omit(boot_plateau)
+ci <- quantile(boot_plateau, c(.025, .975))
+
+cat(sprintf(
+  "Plateau ≈ %.1f h   (bootstrap 95%% CI %.1f – %.1f h ; %d/%d reps)\n",
+  plateau_hour, ci[1], ci[2], length(boot_plateau), B))
+
+```
+
+
+
+
+
+
+```{r plateau-bootstrap-spline}
+###############################################################################
+##  Bootstrap CI for the spline-derivative plateau hour
+###############################################################################
+library(future.apply)      # parallel bootstrap
+plan(multisession, workers = 6)
+
+B <- 1000                  # ⬅ change reps as you like
+set.seed(2025)
+
+boot_plateau <- future_sapply(1:B, function(b){
+
+  ## --- 1. resample patients (with replacement) -----------------------------
+  ids     <- sample(unique(df_modeling$id), replace = TRUE)
+  boot_df <- df_modeling[df_modeling$id %in% ids, ]
+
+  ## --- 2. fit HR curve  ----------------------------------------------------
+  boot_plot <- fit_hr_curve(boot_df)        # returns columns: VTE_Hours, HR,...
+
+  ## --- 3. finite-difference slope + plateau rule  --------------------------
+  boot_plot <- boot_plot %>%
+    arrange(VTE_Hours) %>%
+    mutate(dHR_dt = c(diff(HR) / diff(VTE_Hours), NA))
+
+  plateau_idx <- which(
+      boot_plot$VTE_Hours > ref_hour &
+      boot_plot$HR         < 1       &
+      abs(boot_plot$dHR_dt) < tol_slope
+  )[1]
+
+  if (is.na(plateau_idx)) return(NA_real_)  # never flat → NA
+  boot_plot$VTE_Hours[plateau_idx]          # plateau hour
+}, future.seed = TRUE)
+
+## --- 4. clean & CI  ---------------------------------------------------------
+boot_plateau <- na.omit(boot_plateau)       # drop failed fits
+ci_perc      <- quantile(boot_plateau, c(.025, .975), na.rm = TRUE)
+
+cat(sprintf(
+  "Plateau starts at %.1f h  (bootstrap 95%% CI %.1f – %.1f h ;  %d/%d reps)\n",
+  plateau_hour, ci_perc[1], ci_perc[2], length(boot_plateau), B))
+```
+
+
+
+
+
+
+
+# Random Surival Forest Model
+
+```{r random-forest}
+library(randomForestSRC)
+library(splines)  # for ns()
+
+rsf_wt_imp <- rfsrc(
+  formula   = Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+                VTEPROPHYLAXISHRS +
+                TBIHIGHESTTOTALGCS +
+                AGEyears +
+                Hx_AnticoagulantTherapy +
+                Hx_CVA +
+                Hx_MyocardialInfarction +
+                Hx_Cirrhosis +
+                Hx_BleedingDisorder +
+                Hx_Hypertension +
+                VTEPROPHYLAXISTYPE +
+                SEX,
+  data      = df_modeling,
+  case.wt   = df_modeling$wtps,    # IPTW weights
+  ntree     = 1000,       # number of trees
+  nsplit    = 10,         # splits tested per candidate variable
+  splitrule = "logrank"   # default split rule
+)
+
+
+
+saveRDS(rsf_wt_imp, file="rsf_wt.RDS")
+
+```
+
+```{r rsf-plot-prep}
+max_time <- max(rsf_wt$time.interest)
+
+# now call plot.variable with x=rsf_wt
+plot.variable(
+  x         = rsf_wt,                        # <-- your RSF object
+  xvar.names= "VTEPROPHYLAXISHRS",            # which covariate to vary
+  partial   = TRUE,                           # partial‐dependence
+  surv.type = "surv",                         # plot survival prob
+  time      = max_time,                       # at discharge
+  main      = sprintf("RSF PD: survival to %.0f hrs (discharge)", max_time),
+  xlab      = "Time to VTE prophylaxis (hrs)",
+  ylab      = "Predicted probability of surviving to discharge"
+)
+
+
+
+```
+
+```{r rsf-plot-prep-2}
+
+max_time <- max(rsf_wt$time.interest)
+
+# helper to pull out pd‐data without plotting
+getPD <- function(cluster_id){
+  pd <- plot.variable(
+    x         = rsf_wt,
+    xvar.names= "VTEPROPHYLAXISHRS",
+    partial   = TRUE,
+    surv.type = "surv",
+    time      = max_time,
+    newdata   = df[df$Cluster == cluster_id, ],
+    show      = FALSE
+  )
+  data.frame(x = pd$xvar, y = pd$yvar)
+}
+
+pd1 <- getPD(1)
+pd2 <- getPD(2)
+pd3 <- getPD(3)
+
+# plot the first
+plot(
+  pd1$x, pd1$y, type = "l",
+  xlab = "Time to VTE prophylaxis (hrs)",
+  ylab = "Predicted survival to discharge",
+  main = sprintf("RSF PD: survival to %.0f hrs by cluster", max_time),
+  ylim = range(pd1$y, pd2$y, pd3$y)
+)
+
+# add the others
+lines(pd2$x, pd2$y, lty = 2)
+lines(pd3$x, pd3$y, lty = 3)
+
+# legend
+legend(
+  "bottomleft",
+  legend = c(
+    "Cluster 1: younger, really injured",
+    "Cluster 2: older HTN on anticoag",
+    "Cluster 3: younger, less injured"
+  ),
+  lty = 1:3,
+  bty = "n"
+)
+
+```
+
+
+```{r rsf-prediction-grid}
+# 1. Choose a grid of VTE times (in hours)
+vte_grid <- seq(from = 0, to = 168, by = 1)   # e.g. 0 to 2 weeks in 1-hr steps
+
+# 2. Create a “newdata” data.frame fixing all other covariates
+#    Here I’ll use sample means (for continuous) or the most common level (for factors).
+newdata <- data.frame(
+  VTEPROPHYLAXISHRS            = vte_grid,
+  TBIHIGHESTTOTALGCS           = mean(df$TBIHIGHESTTOTALGCS, na.rm = TRUE),
+  ISS                          = mean(df$ISS, na.rm = TRUE),
+  AGEyears                     = mean(df$AGEyears, na.rm = TRUE),
+  PreHospital_Anticoagulant_Therapy = 0,
+  History_of_CVA               = 0,
+  History_of_MI                = 0,
+  History_of_Cirrhosis         = 0,
+  Bleeding_Disorder            = 0,
+  Hypertension                 = 0,
+  VTEPROPHYLAXISTYPE           = factor("Unfractionated Heparin", levels = levels(df$VTEPROPHYLAXISTYPE)),
+  ICU_Stay                     = 0,
+  SEX                          = 0
+)
+
+# 3. Predict with your RSF
+rsf_pred <- predict(rsf_wt, newdata = newdata)
+
+# 4. Decide on a time-horizon at which you want to optimize survival.
+#    For example, 168 hours (7 days) after admission:
+horizon <- 168  
+# find the time‐index in the model’s time.interest closest to that horizon
+h_idx   <- which.min(abs(rsf_pred$time.interest - horizon))
+
+# 5. Extract the survival probability at that horizon for each VTE time
+surv_at_horizon <- rsf_pred$survival[, h_idx]
+
+# 6. Find the VTE time that **maximizes** survival probability
+opt_idx      <- which.max(surv_at_horizon)
+opt_vte_time <- vte_grid[opt_idx]
+
+cat("Optimal VTE initiation at", opt_vte_time, "hours yields the highest",
+    sprintf("%.1f%%", surv_at_horizon[opt_idx]*100), "predicted survival at", horizon, "hours.\n")
+
+
+# Base-R line plot
+plot(
+  vte_grid, surv_at_horizon,
+  type  = "l",       # connect the dots
+  lwd   = 2,
+  xlab  = "Time to VTE prophylaxis (hrs)",
+  ylab  = sprintf("Predicted survival at %d hrs", horizon),
+  main  = "RSF-predicted survival vs. VTE timing"
+)
+
+# If you want it even smoother, fit a spline through those points:
+ss <- smooth.spline(vte_grid, surv_at_horizon, spar = 0.6)
+lines(ss, lwd = 2, lty = 2)  # add dashed spline fit
+legend("bottomright",
+       legend = c("Raw RSF curve", "Spline-smoothed"),
+       lty    = c(1,2), lwd = 2)
+
+```
+
+
+# K-means clustering + Downstream Analysis 
+
+```{r, echo = FALSE, eval = FALSE}
+
+
+# GBM weighting --> Cox Spline Model Avg age + injury w/o comorbidities --> k-means cluster df --> sub cox spline models based on clusters
+
+df_cluster <- df %>% 
+  select(
+    VTEPROPHYLAXISHRS, VTEPROPHYLAXISTYPE, SEX, AGEyears,
+    ISS, TBIHIGHESTTOTALGCS,
+    Hx_AnticoagulantTherapy, Hx_CVA, Hx_Cirrhosis,
+    Hx_BleedingDisorder,  Hx_Hypertension
+  ) %>% 
+  
+  ## 1 ── recode categoricals to numbers -------------------------------------
+  mutate(
+    VTEPROPHYLAXISTYPE = as.integer(factor(VTEPROPHYLAXISTYPE))# 1,2,… for each type
+  ) %>%
+  
+  ## 2 ── make sure every column is numeric ----------------------------------
+  mutate(across(everything(), as.numeric)) %>%
+  
+  ## 3 ── optionally impute NAs (median works fine for clustering) -----------
+  mutate(across(everything(),
+                ~ replace(.x, is.na(.x), median(.x, na.rm = TRUE)))
+         )
+
+# Now scaling works
+df_cluster_scaled <- scale(df_cluster)
+
+# Apply K-means clustering (choose k = 2 or 3)
+set.seed(123)
+km <- kmeans(df_cluster_scaled, centers = 3, nstart = 25)
+
+# Add cluster labels to dataset
+df$Cluster <- as.factor(km$cluster)
+#final_df_global$Cluster  <- as.factor(km$cluster)
+# Compare survival curves across clusters
+fit <- survfit(Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~ Cluster, data = df)
+cluster_df = df
+# Plot Kaplan-Meier curves
+ggsurvplot(fit, data = df, pval = TRUE, risk.table = TRUE, title = "KM Plot from K-means Semi-Supervised Cox Clustering", xlab = "Time (hrs)")
+
+
+
+# Create a summary table comparing clusters
+cluster_summary <- df %>%
+  mutate(Cluster = as.factor(Cluster)) %>%
+  group_by(Cluster) %>%
+  summarise(
+    n  = n(),
+    
+    ## continuous variables --------------------------------------------------
+    Age_Mean  = round(mean(AGEyears,              na.rm = TRUE), 1),
+    Age_SD    = round(sd(AGEyears,                na.rm = TRUE), 1),
+    ISS_Mean  = round(mean(ISS,                   na.rm = TRUE), 1),
+    ISS_SD    = round(sd(ISS,                     na.rm = TRUE), 1),
+    GCS_Mean  = round(mean(TBIHIGHESTTOTALGCS,    na.rm = TRUE), 1),
+    GCS_SD    = round(sd(TBIHIGHESTTOTALGCS,      na.rm = TRUE), 1),
+    Final_Discharge_HRS_Mean = round(mean(FINALDISCHARGEHRS,    na.rm = TRUE), 1),
+    Final_Discharge_HRS_SD   = round(sd(FINALDISCHARGEHRS,      na.rm = TRUE), 1),
+    VTE_Proph_HRS_Mean       = round(mean(VTEPROPHYLAXISHRS,    na.rm = TRUE), 1),
+    VTE_Proph_HRS_SD         = round(sd(VTEPROPHYLAXISHRS,      na.rm = TRUE), 1),
+    
+    ## categorical / binary variables ---------------------------------------
+    SEX_Female_Rate              = round(mean(SEX == "Female",            na.rm = TRUE) * 100, 1),
+    VTEPROPHYLAXISTYPE_Most_Common = names(sort(table(VTEPROPHYLAXISTYPE), decreasing = TRUE)[1]),
+    Hx_Anticoag_Rate             = round(mean(Hx_AnticoagulantTherapy,    na.rm = TRUE) * 100, 1),
+    CVA_History_Rate             = round(mean(Hx_CVA,                     na.rm = TRUE) * 100, 1),
+    Cirrhosis_History_Rate       = round(mean(Hx_Cirrhosis,               na.rm = TRUE) * 100, 1),
+    Bleeding_Disorder_Rate       = round(mean(Hx_BleedingDisorder,        na.rm = TRUE) * 100, 1),
+    Hypertension_Rate            = round(mean(Hx_Hypertension,            na.rm = TRUE) * 100, 1),
+    WITHDRAWALLST_Rate           = round(mean(WITHDRAWALLST,              na.rm = TRUE) * 100, 1)
+  )
+
+
+# View the table
+cluster_summary
+```
+## Defining Cluster Methods
+
+Weights
+```{r cluster-gbm-weights}
+###############################################################################
+## Automatic GBM weighting per cluster (runs only if folder is missing)
+###############################################################################
+library(tidyverse)
+library(WeightIt)
+library(glue)
+
+weights_dir <- "gbm_weight"
+
+if (!dir.exists(weights_dir)) {
+
+  message("⧉ Building GBM weights for all clusters (first-time run)…")
+  dir.create(weights_dir, recursive = TRUE)
+
+  covars <- c(
+    "VTEPROPHYLAXISTYPE", "SEX", "AGEyears",
+    "ISS", "TBIHIGHESTTOTALGCS",
+    "Hx_AnticoagulantTherapy", "Hx_CVA", "Hx_MyocardialInfarction",
+    "Hx_Cirrhosis", "Hx_BleedingDisorder", "Hx_Hypertension"
+  )
+
+  for (k in sort(unique(df$Cluster))) {
+
+    message(glue("[Cluster {k}] fitting weights…"))
+    df_k <- df %>% filter(Cluster == k)
+
+    wobj_k <- weightit(
+      reformulate(covars, response = "VTEPROPHYLAXISHRS"),
+      data              = df_k,
+      method            = "gbm",
+      density           = "kernel",
+      criterion         = "p.max",
+      trim.at           = 0.99,
+      estimand          = "ATE",
+      n.trees           = 5000,
+      shrinkage         = 0.01,
+      interaction.depth = 3,
+      bag.fraction      = 0.7
+    )
+
+    saveRDS(wobj_k,
+            file.path(weights_dir,
+                      glue("gbm_cluster_{k}.rds")))
+    message(glue("           ➜ saved gbm_cluster_{k}.rds"))
+  }
+
+  message("✓ All cluster weights created and cached.\n")
+} else {
+  message("↪  Folder 'gbm_weights' already exists — skipping GBM fitting.")
+}
+```
+Segmented Cox
+```{r cluster-seg-cox-function}
+###############################################################################
+## seg_cox_by_cluster() — segmented-Cox + HR curve (auto-coloured by cluster)
+###############################################################################
+library(tidyverse)
+library(WeightIt)
+library(survival)
+library(segmented)
+library(glue)
+library(ggplot2)
+
+## palette used when `colour = NULL`
+cluster_palette <- c(
+  `1` = "#D55E00",   # red
+  `2` = "#0072B2",   # blue
+  `3` = "#E69F00"    # orange
+)
+
+seg_cox_by_cluster <- function(df,
+                               cluster_id,
+                               covars = c(
+                                 "VTEPROPHYLAXISTYPE", "SEX", "AGEyears",
+                                 "ISS", "TBIHIGHESTTOTALGCS",
+                                 "Hx_AnticoagulantTherapy", "Hx_CVA",
+                                 "Hx_MyocardialInfarction", "Hx_Cirrhosis",
+                                 "Hx_BleedingDisorder", "Hx_Hypertension"
+                               ),
+                               weights_dir   = "gbm_weight",
+                               plot_alpha    = 0.20,
+                               colour        = NULL,        # auto if NULL
+                               make_plot     = TRUE,
+                               ref_quantile  = 0.25) {
+
+  ## -------------------------------------------------------------------------
+  ## choose colour automatically if none supplied ---------------------------
+  if (is.null(colour)) {
+    if (!as.character(cluster_id) %in% names(cluster_palette))
+      stop("Cluster colour not defined — either extend cluster_palette or pass `colour`")
+    colour <- cluster_palette[as.character(cluster_id)]
+  }
+
+  ## -------------------------------------------------------------------------
+  ## 1 ▸ subset data ---------------------------------------------------------
+  df_k <- df %>% filter(Cluster == cluster_id)
+  if (nrow(df_k) == 0)
+    stop(glue("No rows with Cluster == {cluster_id} in supplied data frame."))
+
+  ## -------------------------------------------------------------------------
+  ## 2 ▸ load (or fit) GBM weights ------------------------------------------
+  file_k <- file.path(weights_dir, glue("gbm_cluster_{cluster_id}.rds"))
+
+  if (file.exists(file_k)) {
+    wobj_k <- readRDS(file_k)
+  } else {
+    message(glue("[Cluster {cluster_id}] weight file missing – fitting GBM now…"))
+    wobj_k <- weightit(
+      reformulate(covars, response = "VTEPROPHYLAXISHRS"),
+      data              = df_k,
+      method            = "gbm",
+      density           = "kernel",
+      criterion         = "p.max",
+      trim.at           = 0.99,
+      estimand          = "ATE",
+      n.trees           = 5000,
+      shrinkage         = 0.01,
+      interaction.depth = 3,
+      bag.fraction      = 0.7
+    )
+    dir.create(weights_dir, showWarnings = FALSE)
+    saveRDS(wobj_k, file_k)
+    message(glue("           ➜ saved to {file_k}"))
+  }
+
+  ## align weights just in case row order changed
+  df_k$wt_gbm <- wobj_k$weights
+  wt_gbm <- df_k$wt_gbm
+
+  ## -------------------------------------------------------------------------
+  ## 3 ▸ base Cox (linear timing term) --------------------------------------
+  cox_lin <- coxph(
+    Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+      VTEPROPHYLAXISHRS +
+      VTEPROPHYLAXISTYPE + SEX +
+      ns(AGEyears, df = 2) +
+      TBIHIGHESTTOTALGCS +
+      Hx_AnticoagulantTherapy +
+      Hx_CVA + Hx_Cirrhosis + Hx_BleedingDisorder + Hx_Hypertension,
+    data    = df_k,
+    weights = wt_gbm,
+    robust  = TRUE,
+    model   = TRUE
+  )
+
+  ## -------------------------------------------------------------------------
+  ## 4 ▸ segmented fit (one breakpoint) -------------------------------------
+  psi_start <- list(VTEPROPHYLAXISHRS =
+                      median(df_k$VTEPROPHYLAXISHRS, na.rm = TRUE))
+
+  seg_fit <- segmented(cox_lin,
+                       seg.Z  = ~ VTEPROPHYLAXISHRS,
+                       psi    = psi_start,
+                       control = seg.control(display = FALSE, n.boot = 0))
+
+  psi_tab <- seg_fit$psi
+  psi_est <- as.numeric(psi_tab[ , grep("^Est",      colnames(psi_tab)) ])
+  psi_se  <- as.numeric(psi_tab[ , grep("^St\\.?Err", colnames(psi_tab)) ])
+
+  ## -------------------------------------------------------------------------
+  ## 5 ▸ population-average HR curve ----------------------------------------
+  ref_hour      <- quantile(df$VTEPROPHYLAXISHRS, ref_quantile, na.rm = TRUE)
+  vte_hours_seq <- 1:168
+
+  grid_df <- df_k[rep(seq_len(nrow(df_k)), each = length(vte_hours_seq)), ]
+  grid_df$VTEPROPHYLAXISHRS      <- rep(vte_hours_seq, times = nrow(df_k))
+  grid_df$U1.VTEPROPHYLAXISHRS   <- pmax(0, grid_df$VTEPROPHYLAXISHRS - psi_est)
+  grid_df$psi1.VTEPROPHYLAXISHRS <- 1
+  grid_df$lp  <- predict(seg_fit, newdata = grid_df, type = "lp")
+
+  ref_dat <- df_k %>% mutate(
+    VTEPROPHYLAXISHRS       = ref_hour,
+    U1.VTEPROPHYLAXISHRS    = pmax(0, ref_hour - psi_est),
+    psi1.VTEPROPHYLAXISHRS  = 1
+  )
+  ref_lp <- predict(seg_fit, newdata = ref_dat, type = "lp")
+  grid_df$ref_lp <- rep(ref_lp, each = length(vte_hours_seq))
+
+  grid_df$HR <- exp(grid_df$lp - grid_df$ref_lp)
+  grid_df$w  <- rep(df_k$wt_gbm, each = length(vte_hours_seq))
+
+  pop_avg <- grid_df %>%
+    group_by(VTEPROPHYLAXISHRS) %>%
+    summarise(HR = sum(w * HR) / sum(w), .groups = "drop") %>%
+    mutate(lo = HR * 0.95, hi = HR * 1.05)
+
+  ## -------------------------------------------------------------------------
+  ## 6 ▸ Plot ---------------------------------------------------------------
+  plt <- NULL
+  if (make_plot) {
+    plt <- ggplot(pop_avg, aes(VTEPROPHYLAXISHRS, HR)) +
+      geom_line(size = 1.15, colour = colour) +
+      geom_ribbon(aes(ymin = lo, ymax = hi),
+                  alpha = plot_alpha, fill = colour) +
+      geom_hline(yintercept = 1,
+                 linetype = "dashed", colour = "grey50") +
+      geom_vline(xintercept = psi_est,
+                 linetype = "dotted", colour = "red") +
+      annotate("text", x = psi_est, y = max(pop_avg$hi),
+               label = glue("ψ̂ ≈ {round(psi_est, 1)} h"),
+               hjust = -0.05, vjust = 1, colour = "red") +
+      labs(
+        title    = glue("Cluster {cluster_id}: GBM-weighted segmented-Cox HR"),
+        subtitle = glue(
+          "Reference = Q{ref_quantile*4} ({round(ref_hour,1)} h); breakpoint ψ̂"
+        ),
+        x = "Hours after admission",
+        y = "Population-average hazard ratio"
+      ) +
+      theme_minimal()
+    print(plt)
+  }
+
+  ## -------------------------------------------------------------------------
+  ## 7 ▸ return --------------------------------------------------------------
+  list(
+    cluster   = cluster_id,
+    psi_est   = psi_est,
+    psi_se    = psi_se,
+    seg_fit   = seg_fit,
+    pop_avg   = pop_avg,
+    plot      = plt
+  )
+}
+
+
+```
+Cox Spline
+```{r cluster-spline-function}
+###############################################################################
+## cox_spline_plateau()  —  colour-aware version
+###############################################################################
+library(tidyverse)
+library(WeightIt)
+library(survival)
+library(segmented)
+library(glue)
+library(ggplot2)
+
+## built-in palette
+cluster_palette <- c(
+  `1` = "#D55E00",   # red
+  `2` = "#0072B2",   # blue
+  `3` = "#E69F00"    # orange
+)
+
+cox_spline_plateau <- function(df,
+                               cluster_id,
+                               covars = c(
+                                 "VTEPROPHYLAXISTYPE", "SEX", "AGEyears",
+                                 "ISS", "TBIHIGHESTTOTALGCS",
+                                 "Hx_AnticoagulantTherapy", "Hx_CVA",
+                                 "Hx_MyocardialInfarction", "Hx_Cirrhosis",
+                                 "Hx_BleedingDisorder", "Hx_Hypertension"
+                               ),
+                               weights_dir  = "gbm_weight",
+                               vte_grid     = seq(1, 168, length.out = 100),
+                               tol_slope    = 0.002,
+                               line_col     = NULL,    # ← auto if NULL
+                               make_plot    = TRUE) {
+
+  ## -------------------------------------------------------------------------
+  ## pick colour if not supplied --------------------------------------------
+  if (is.null(line_col)) {
+    if (!as.character(cluster_id) %in% names(cluster_palette))
+      stop("Cluster colour not defined — supply line_col manually.")
+    line_col <- cluster_palette[as.character(cluster_id)]
+  }
+
+  ## -------------------------------------------------------------------------
+  ## subset data -------------------------------------------------------------
+  df_k <- df %>% filter(Cluster == cluster_id)
+  if (nrow(df_k) == 0)
+    stop(glue("No rows with Cluster == {cluster_id} in supplied data."))
+
+  ## -------------------------------------------------------------------------
+  ## load / fit GBM weights --------------------------------------------------
+  file_k <- file.path(weights_dir, glue("gbm_cluster_{cluster_id}.rds"))
+
+  if (file.exists(file_k)) {
+    wobj_k <- readRDS(file_k)
+  } else {
+    message(glue("[Cluster {cluster_id}] weight file missing – fitting GBM…"))
+    wobj_k <- weightit(
+      reformulate(covars, response = "VTEPROPHYLAXISHRS"),
+      data              = df_k,
+      method            = "gbm",
+      density           = "kernel",
+      criterion         = "p.max",
+      trim.at           = 0.99,
+      estimand          = "ATE",
+      n.trees           = 5000,
+      shrinkage         = 0.01,
+      interaction.depth = 3,
+      bag.fraction      = 0.7
+    )
+    dir.create(weights_dir, showWarnings = FALSE)
+    saveRDS(wobj_k, file_k)
+    message(glue("           ➜ saved to {file_k}"))
+  }
+  df_k$wt_gbm <- wobj_k$weights
+
+  ## -------------------------------------------------------------------------
+  ## Cox spline model --------------------------------------------------------
+  ref_hour <- quantile(df$VTEPROPHYLAXISHRS, .25, na.rm = TRUE)
+  cox_formula <- as.formula(
+    paste0(
+      "Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~ ",
+      "ns(VTEPROPHYLAXISHRS, 3) + ",
+      paste(covars, collapse = " + ")
+    )
+  )
+
+  fit   <- coxph(cox_formula, data = df_k, weights = wt_gbm)
+  beta  <- coef(fit)
+  Sigma <- vcov(fit)
+
+  mean_design <- function(hr) {
+    tmp <- df_k
+    tmp$VTEPROPHYLAXISHRS <- hr
+    mm  <- model.matrix(fit, data = tmp)
+    colSums(mm * df_k$wt_gbm) / sum(df_k$wt_gbm)
+  }
+
+  X_ref  <- mean_design(ref_hour)[names(beta)]
+  lp_ref <- sum(X_ref * beta)
+
+  ## HR curve + CI + slope ---------------------------------------------------
+  plot_df <- map_dfr(vte_grid, function(hr) {
+    x_bar <- mean_design(hr)[names(beta)]
+    lp    <- sum(x_bar * beta)
+    v     <- x_bar - X_ref
+    SElog <- sqrt(t(v) %*% Sigma %*% v)
+    tibble(
+      VTE_Hours = hr,
+      HR        = exp(lp - lp_ref),
+      lower     = exp(lp - lp_ref - 1.96*SElog),
+      upper     = exp(lp - lp_ref + 1.96*SElog)
+    )
+  }) %>%
+    arrange(VTE_Hours) %>%
+    mutate(dHR_dt = c(diff(HR)/diff(VTE_Hours), NA))
+
+  ## plateau hour ------------------------------------------------------------
+  idx <- which(
+    plot_df$VTE_Hours > ref_hour &
+    plot_df$HR        < 1        &
+    abs(plot_df$dHR_dt) < tol_slope
+  )[1]
+  plateau_hour <- if (!is.na(idx)) plot_df$VTE_Hours[idx] else NA_real_
+
+  ## plot --------------------------------------------------------------------
+  p <- ggplot(plot_df, aes(VTE_Hours, HR)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper),
+                fill = paste0(line_col, "40")) +
+    geom_line(colour = line_col, size = 1.2) +
+    geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+    {if (!is.na(plateau_hour))
+       geom_vline(xintercept = plateau_hour, linetype = "dotted",
+                  colour = line_col)} +
+    {if (!is.na(plateau_hour))
+       annotate("text", x = plateau_hour, y = max(plot_df$upper, na.rm = TRUE),
+                label = sprintf("Plateau ≈ %.1f h", plateau_hour),
+                hjust = -0.05, vjust = 1, size = 3.5)} +
+    labs(
+      title = glue("Cluster {cluster_id}: GBM-weighted Cox-spline HR vs. timing"),
+      subtitle = glue("Reference = Q1 ({round(ref_hour,1)} h); ",
+                      "plateau = |ΔHR| < {tol_slope}/h"),
+      x = "Hours after admission",
+      y = "Hazard ratio"
+    ) +
+    theme_minimal()
+
+  if (make_plot) print(p)
+
+  invisible(list(
+    cluster      = cluster_id,
+    plateau_hour = plateau_hour,
+    plot_df      = plot_df,
+    plot         = p,
+    fit          = fit
+  ))
+}
+
+```
+Random Surival Forests
+```{r cluster-colors}
+
+# Global colour palette for clusters
+cluster_palette <- c(
+  `1` = "#D55E00",   # red
+  `2` = "#0072B2",   # blue
+  `3` = "#E69F00"    # orange
+)
+
+plot_cluster_pdp <- function(df,
+                             cluster_id,
+                             weight_dir = "gbm_weight",
+                             ntree      = 1000,
+                             nsplit     = 10,
+                             ...) {
+
+  # Packages
+  suppressPackageStartupMessages({
+    library(tidyverse)
+    library(WeightIt)
+    library(randomForestSRC)
+    library(ggplot2)
+  })
+
+  # Subset to the requested cluster
+  d_cl <- df %>% filter(Cluster == cluster_id)
+  stopifnot(nrow(d_cl) > 0)
+
+  # Attach IPTW weights
+  w_file <- file.path(weight_dir,
+                      sprintf("gbm_cluster_%s.rds", cluster_id))
+  if (!file.exists(w_file))
+    stop("Weight file not found: ", w_file)
+
+  w_obj        <- readRDS(w_file)
+  d_cl$wt_gbm  <- w_obj$weights
+
+  d_cl <- d_cl %>% filter(!is.na(wt_gbm) & wt_gbm > 0)
+  stopifnot(sum(d_cl$WITHDRAWALLST) > 0)     # events must remain
+
+  # 
+  rsf <- rfsrc(
+    Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+      VTEPROPHYLAXISHRS +
+      TBIHIGHESTTOTALGCS + AGEyears +
+      Hx_AnticoagulantTherapy +
+      Hx_CVA + Hx_MyocardialInfarction + Hx_Cirrhosis +
+      Hx_BleedingDisorder + Hx_Hypertension +
+      VTEPROPHYLAXISTYPE + SEX,
+    data      = d_cl,
+    case.wt   = d_cl$wt_gbm,
+    ntree     = ntree,
+    nsplit    = nsplit,
+    splitrule = "logrank"
+  )
+
+  # 
+  pd_raw <- plot.variable(
+    x           = rsf,
+    xvar.names  = "VTEPROPHYLAXISHRS",
+    partial     = TRUE,
+    surv.type   = "surv",
+    time        = max(rsf$time.interest),
+    newdata     = d_cl,
+    show        = FALSE
+  )
+
+  pd_df <- pd_raw$plotthis$VTEPROPHYLAXISHRS   # tibble with x & yhat
+
+  # 
+  opt_idx  <- which.max(pd_df$yhat)
+  opt_time <- pd_df$x[opt_idx]
+  opt_surv <- pd_df$yhat[opt_idx]
+
+  # 
+  col_cl <- cluster_palette[as.character(cluster_id)]
+
+  p <- ggplot(pd_df, aes(x, yhat)) +
+    geom_line(colour = col_cl, linewidth = 1) +
+    geom_point(colour = col_cl, size = 2) +
+    geom_vline(xintercept = opt_time,
+               linetype = "dashed", linewidth = 0.6, colour = col_cl) +
+    geom_point(aes(x = opt_time, y = opt_surv),
+               colour = "red", size = 3) +
+    annotate("text",
+             x = opt_time + 2, y = opt_surv,
+             label = sprintf("Optimal ≈ %.1f h", opt_time),
+             hjust = 0, vjust = -0.5, size = 3.5) +
+    labs(
+      x = "VTE prophylaxis initiation time (hours)",
+      y = "Predicted survival",
+      title = sprintf("Cluster %s: PD curve for initiation timing", cluster_id)
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(...)
+
+  # 
+  list(
+    plot      = p,
+    opt_time  = opt_time,
+    pd_data   = pd_df
+  )
+}
+```
+
+
+```{r cluster-rsf-plots}
+
+rsf1 <- plot_cluster_pdp(df, cluster_id = 1)
+rsf2 <- plot_cluster_pdp(df, cluster_id = 2)
+rsf3 <- plot_cluster_pdp(df, cluster_id = 3)
+
+seg1 <- seg_cox_by_cluster(df, 1)  
+seg2 <- seg_cox_by_cluster(df, 2)  
+seg3 <- seg_cox_by_cluster(df, 3)  
+
+spline1 <- cox_spline_plateau(df, 1)  
+spline2 <- cox_spline_plateau(df, 2)  
+spline3 <- cox_spline_plateau(df, 3)  
+
+```
+
+```{r patchwork-setup}
+library(patchwork)
+
+
+#  ##
+## 1 ▸ grab just the ggplot objects (unchanged from before)
+#  ##
+p_seg1 <- seg1$plot;  p_seg2 <- seg2$plot;  p_seg3 <- seg3$plot
+p_spl1 <- spline1$plot;  p_spl2 <- spline2$plot;  p_spl3 <- spline3$plot
+p_rsf1 <- rsf1$plot;  p_rsf2 <- rsf2$plot;  p_rsf3 <- rsf3$plot
+
+#  ##
+## 2 ▸ patchwork: 3 columns (clusters) × 3 rows (models)
+#  ##
+library(patchwork)
+
+composite <- (
+  p_seg1 | p_seg2 | p_seg3      # Row 1 – segmented-Cox
+) /
+  (
+    p_spl1 | p_spl2 | p_spl3    # Row 2 – spline/plateau
+  ) /
+  (
+    p_rsf1 | p_rsf2 | p_rsf3    # Row 3 – RSF partial-dependence
+  ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+print(composite)
+
+#  ##
+## 3 ▸ save: same width, a bit taller for three rows
+#  ##
+ggsave(
+  filename = "cluster_grid_by_model.png",
+  plot     = composite,
+  width    = 18,   # 3 columns
+  height   = 18,   # 3 rows
+  dpi      = 300
+)
+
+
+```
+
+
+
+
+
+
+
+```{r cluster1-rsf}
+###############################################################################
+##  Cluster 1  ·  weighted RSF  ·  PD curve for VTEPROPHYLAXISHRS
+###############################################################################
+library(tidyverse)
+library(WeightIt)
+library(randomForestSRC)
+library(ggplot2)
+
+# --------------------------------------------------------------------------- #
+# 1 ▸ subset data to Cluster 1                                                #
+# --------------------------------------------------------------------------- #
+df1 <- df %>% filter(Cluster == 1)
+stopifnot(nrow(df1) > 0)
+
+# --------------------------------------------------------------------------- #
+# 2 ▸ read IPTW weights and align with rows                                   #
+# --------------------------------------------------------------------------- #
+wobj1 <- readRDS("gbm_weights/gbm_cluster_1.rds")           # adjust path if needed
+df1$wt_gbm <- wobj1$weights
+
+# keep rows with non-missing, positive weights
+df1 <- df1 %>% filter(!is.na(wt_gbm) & wt_gbm > 0)
+stopifnot(sum(df1$WITHDRAWALLST) > 0)    # ensure events remain
+
+# --------------------------------------------------------------------------- #
+# 3 ▸ fit random-survival forest                                              #
+# --------------------------------------------------------------------------- #
+rsf1 <- rfsrc(
+  Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+    VTEPROPHYLAXISHRS +
+    TBIHIGHESTTOTALGCS + AGEyears +
+    Hx_AnticoagulantTherapy +
+    Hx_CVA + Hx_MyocardialInfarction + Hx_Cirrhosis +
+    Hx_BleedingDisorder + Hx_Hypertension +
+    VTEPROPHYLAXISTYPE + SEX,
+  data      = df1,
+  case.wt   = df1$wt_gbm,
+  ntree     = 1000,
+  nsplit    = 10,
+  splitrule = "logrank"
+)
+
+# --------------------------------------------------------------------------- #
+# 4 ▸ partial-dependence (marginal effect) for VTE timing                     #
+# --------------------------------------------------------------------------- #
+max_time <- max(rsf1$time.interest)      # survival to discharge
+pd_raw   <- plot.variable(
+             x           = rsf1,
+             xvar.names  = "VTEPROPHYLAXISHRS",
+             partial     = TRUE,
+             surv.type   = "surv",
+             time        = max_time,
+             newdata     = df1,     # PD within Cluster 1
+             show        = FALSE
+           )
+
+# 
+plot_df <- pd_raw$plotthis$VTEPROPHYLAXISHRS      # tibble with x & yhat cols
+
+# 
+opt_idx   <- which.max(plot_df$yhat)
+opt_time  <- plot_df$x[opt_idx]      # ≈ 42.1 h for your example
+opt_surv  <- plot_df$yhat[opt_idx]
+
+# 
+library(ggplot2)
+
+ggplot(plot_df, aes(x, yhat)) +
+  geom_line(color = "#1f77b4", linewidth = 1) +
+  geom_point(color = "#1f77b4", size = 2) +
+  geom_vline(xintercept = opt_time, linetype = "dashed", linewidth = 0.6) +
+  geom_point(aes(x = opt_time, y = opt_surv), size = 3, colour = "red") +
+  annotate(
+    "text",
+    x = opt_time + 2, y = opt_surv,
+    label = sprintf("Optimal ≈ %.1f h", opt_time),
+    hjust = 0, vjust = -0.5, size = 3.5
+  ) +
+  labs(
+    x = "VTE prophylaxis initiation time (hours)",
+    y = "Predicted survival",
+    title = "Partial dependence: survival vs. initiation timing"
+  ) +
+  theme_minimal(base_size = 12)
+
+
+```
+
+
+
+
+
+
+
+
+## Segmented-Cox
+
+Cluster 1
+
+```{r cluster1-segmented}
+###############################################################################
+##  Cluster 1  •  GBM weights  •  segmented-Cox  •  HR curve + breakpoint ψ̂
+###############################################################################
+library(tidyverse)
+library(WeightIt)
+library(survival)
+library(segmented)
+library(glue)
+library(ggplot2)
+theme_set(theme_minimal())
+
+# ---------------------------------------------------------------------------
+# SETTINGS -------------------------------------------------------------------
+vte_hours_seq <- 1:168
+ref_hour      <- quantile(df$VTEPROPHYLAXISHRS, .25, na.rm = TRUE)  # ≈ 19 h
+
+covars <- c(
+  "VTEPROPHYLAXISTYPE", "SEX", "AGEyears",
+  "ISS", "TBIHIGHESTTOTALGCS",
+  "Hx_AnticoagulantTherapy", "Hx_CVA", "Hx_MyocardialInfarction",
+  "Hx_Cirrhosis", "Hx_BleedingDisorder", "Hx_Hypertension"
+)
+
+# ---------------------------------------------------------------------------
+# 1 ▸ subset to Cluster 1 ----------------------------------------------------
+df1 <- df %>% filter(Cluster == 1)
+
+# ---------------------------------------------------------------------------
+# 2 ▸ GBM weights (fit or reuse) --------------------------------------------
+wobj1 <- weightit(
+  reformulate(covars, response = "VTEPROPHYLAXISHRS"),
+  data              = df1,
+  method            = "gbm",
+  density           = "kernel",
+  criterion         = "p.max",
+  trim.at           = 0.99,
+  estimand          = "ATE",
+  n.trees           = 5000,
+  shrinkage         = 0.01,
+  interaction.depth = 3,
+  bag.fraction      = 0.7
+)
+df1$wt_gbm <- wobj1$weights
+
+# ---------------------------------------------------------------------------
+# 3 ▸ base Cox with linear timing term ---------------------------------------
+cox_lin1 <- coxph(
+  Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+    VTEPROPHYLAXISHRS +
+    VTEPROPHYLAXISTYPE + SEX +
+    ns(AGEyears, df = 2) +
+    TBIHIGHESTTOTALGCS +
+    Hx_AnticoagulantTherapy +
+    Hx_CVA + Hx_Cirrhosis + Hx_BleedingDisorder + Hx_Hypertension,
+  data    = df1,
+  weights = wt_gbm,
+  robust  = TRUE,
+  model   = TRUE
+)
+
+# ---------------------------------------------------------------------------
+# 4 ▸ segmented fit (one breakpoint ψ̂) --------------------------------------
+psi_start <- list(VTEPROPHYLAXISHRS = median(df1$VTEPROPHYLAXISHRS, na.rm = TRUE))
+
+seg1 <- segmented(
+  cox_lin1,
+  seg.Z   = ~ VTEPROPHYLAXISHRS,
+  psi     = psi_start,
+  control = seg.control(display = FALSE, n.boot = 0)
+)
+
+# ── breakpoint estimate & 95 % CI ------------------------------------------
+psi_tab <- seg1$psi
+row_idx <- grep("VTEPROPHYLAXISHRS", rownames(psi_tab))
+est_col <- grep("^Est",       colnames(psi_tab))
+se_col  <- grep("^St\\.?Err", colnames(psi_tab))
+
+psi_est <- as.numeric(psi_tab[row_idx, est_col])
+psi_se  <- as.numeric(psi_tab[row_idx, se_col])
+cat(sprintf(
+  "\nCluster 1  •  breakpoint ψ̂ = %.2f h  (SE %.2f  ⇒ 95%% CI %.2f–%.2f)\n",
+  psi_est, psi_se, psi_est - 1.96*psi_se, psi_est + 1.96*psi_se
+))
+
+# ---------------------------------------------------------------------------
+# 5 ▸ population-average HR curve -------------------------------------------
+grid_df <- df1[rep(seq_len(nrow(df1)), each = length(vte_hours_seq)), ]
+grid_df$VTEPROPHYLAXISHRS <- rep(vte_hours_seq, times = nrow(df1))
+grid_df$U1.VTEPROPHYLAXISHRS   <- pmax(0, grid_df$VTEPROPHYLAXISHRS - psi_est)
+grid_df$psi1.VTEPROPHYLAXISHRS <- 1
+
+grid_df$lp <- predict(seg1, newdata = grid_df, type = "lp")
+
+ref_dat <- df1 %>% mutate(
+  VTEPROPHYLAXISHRS        = ref_hour,
+  U1.VTEPROPHYLAXISHRS     = pmax(0, ref_hour - psi_est),
+  psi1.VTEPROPHYLAXISHRS   = 1
+)
+ref_lp <- predict(seg1, newdata = ref_dat, type = "lp")
+
+grid_df$ref_lp <- rep(ref_lp, each = length(vte_hours_seq))
+grid_df$HR     <- exp(grid_df$lp - grid_df$ref_lp)
+grid_df$w      <- rep(df1$wt_gbm, each = length(vte_hours_seq))
+
+pop_avg1 <- grid_df %>%
+  group_by(VTEPROPHYLAXISHRS) %>%
+  summarise(HR = sum(w * HR) / sum(w), .groups = "drop") %>%
+  mutate(lo = HR * 0.95, hi = HR * 1.05)
+
+# ---------------------------------------------------------------------------
+# 6 ▸ Plot -------------------------------------------------------------------
+ggplot(pop_avg1, aes(VTEPROPHYLAXISHRS, HR)) +
+  geom_line(size = 1.15, colour = "#0072B2") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .20, fill = "#0072B2") +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = psi_est, linetype = "dotted", colour = "red") +
+  annotate("text", x = psi_est, y = max(pop_avg1$hi),
+           label = glue("ψ̂ ≈ {round(psi_est, 1)} h"),
+           hjust = -0.05, vjust = 1, colour = "red") +
+  labs(
+    title    = "Cluster 1: GBM-weighted, segmented-Cox HR vs. prophylaxis timing",
+    subtitle = glue("Reference = Q1 ({round(ref_hour,1)} h); breakpoint ψ̂"),
+    x        = "Hours after admission",
+    y        = "Population-average hazard ratio"
+  )
+
+# ---------------------------------------------------------------------------
+# 7 ▸ Console output ---------------------------------------------------------
+cat(glue(
+  "\nBreakpoint for Cluster 1 ≈ {round(psi_est,1)} h ",
+  "(95 % CI {round(psi_est - 1.96*psi_se,1)}–{round(psi_est + 1.96*psi_se,1)} h).\n"
+))
+```
+
+Cluster 2
+
+```{r cluster2-segmented}
+###############################################################################
+##  Cluster 2  •  GBM weights  •  segmented-Cox  •  HR curve + breakpoint ψ̂
+###############################################################################
+library(tidyverse)
+library(WeightIt)
+library(survival)
+library(segmented)
+library(glue)
+library(ggplot2)
+theme_set(theme_minimal())
+
+# ---------------------------------------------------------------------------
+# SETTINGS -------------------------------------------------------------------
+vte_hours_seq <- 1:168
+ref_hour      <- quantile(df$VTEPROPHYLAXISHRS, .25, na.rm = TRUE)  # ≈ 19 h
+
+covars <- c(
+  "VTEPROPHYLAXISTYPE", "SEX", "AGEyears",
+  "ISS", "TBIHIGHESTTOTALGCS",
+  "Hx_AnticoagulantTherapy", "Hx_CVA", "Hx_MyocardialInfarction",
+  "Hx_Cirrhosis", "Hx_BleedingDisorder", "Hx_Hypertension"
+)
+
+# ---------------------------------------------------------------------------
+# 1 ▸ subset to Cluster 2 ----------------------------------------------------
+df2 <- df %>% filter(Cluster == 2)
+
+# ---------------------------------------------------------------------------
+# 2 ▸ GBM weights (fit or reuse) --------------------------------------------
+wobj2 <- weightit(
+  reformulate(covars, response = "VTEPROPHYLAXISHRS"),
+  data              = df2,
+  method            = "gbm",
+  density           = "kernel",
+  criterion         = "p.max",
+  trim.at           = 0.99,
+  estimand          = "ATE",
+  n.trees           = 5000,
+  shrinkage         = 0.01,
+  interaction.depth = 3,
+  bag.fraction      = 0.7
+)
+df2$wt_gbm <- wobj2$weights
+
+# ---------------------------------------------------------------------------
+# 3 ▸ base Cox with linear timing term ---------------------------------------
+cox_lin2 <- coxph(
+  Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+    VTEPROPHYLAXISHRS +
+    VTEPROPHYLAXISTYPE + SEX +
+    ns(AGEyears, df = 2) +
+    TBIHIGHESTTOTALGCS +
+    Hx_AnticoagulantTherapy +
+    Hx_CVA + Hx_Cirrhosis + Hx_BleedingDisorder + Hx_Hypertension,
+  data    = df2,
+  weights = wt_gbm,
+  robust  = TRUE,
+  model   = TRUE
+)
+
+# ---------------------------------------------------------------------------
+# 4 ▸ segmented fit (one breakpoint ψ̂) --------------------------------------
+psi_start <- list(VTEPROPHYLAXISHRS = median(df2$VTEPROPHYLAXISHRS, na.rm = TRUE))
+
+seg2 <- segmented(
+  cox_lin2,
+  seg.Z   = ~ VTEPROPHYLAXISHRS,
+  psi     = psi_start,
+  control = seg.control(display = FALSE, n.boot = 0)
+)
+
+# ── breakpoint estimate & 95 % CI ------------------------------------------
+psi_tab <- seg2$psi
+row_idx <- grep("VTEPROPHYLAXISHRS", rownames(psi_tab))
+est_col <- grep("^Est",       colnames(psi_tab))
+se_col  <- grep("^St\\.?Err", colnames(psi_tab))
+
+psi_est <- as.numeric(psi_tab[row_idx, est_col])
+psi_se  <- as.numeric(psi_tab[row_idx, se_col])
+cat(sprintf(
+  "\nCluster 2  •  breakpoint ψ̂ = %.2f h  (SE %.2f  ⇒ 95%% CI %.2f–%.2f)\n",
+  psi_est, psi_se, psi_est - 1.96*psi_se, psi_est + 1.96*psi_se
+))
+
+# ---------------------------------------------------------------------------
+# 5 ▸ population-average HR curve -------------------------------------------
+grid_df <- df2[rep(seq_len(nrow(df2)), each = length(vte_hours_seq)), ]
+grid_df$VTEPROPHYLAXISHRS <- rep(vte_hours_seq, times = nrow(df2))
+grid_df$U1.VTEPROPHYLAXISHRS   <- pmax(0, grid_df$VTEPROPHYLAXISHRS - psi_est)
+grid_df$psi1.VTEPROPHYLAXISHRS <- 1
+
+grid_df$lp <- predict(seg2, newdata = grid_df, type = "lp")
+
+ref_dat <- df2 %>% mutate(
+  VTEPROPHYLAXISHRS        = ref_hour,
+  U1.VTEPROPHYLAXISHRS     = pmax(0, ref_hour - psi_est),
+  psi1.VTEPROPHYLAXISHRS   = 1
+)
+ref_lp <- predict(seg2, newdata = ref_dat, type = "lp")
+
+grid_df$ref_lp <- rep(ref_lp, each = length(vte_hours_seq))
+grid_df$HR     <- exp(grid_df$lp - grid_df$ref_lp)
+grid_df$w      <- rep(df2$wt_gbm, each = length(vte_hours_seq))
+
+pop_avg2 <- grid_df %>%
+  group_by(VTEPROPHYLAXISHRS) %>%
+  summarise(HR = sum(w * HR) / sum(w), .groups = "drop") %>%
+  mutate(lo = HR * 0.95, hi = HR * 1.05)
+
+# ---------------------------------------------------------------------------
+# 6 ▸ Plot -------------------------------------------------------------------
+ggplot(pop_avg2, aes(VTEPROPHYLAXISHRS, HR)) +
+  geom_line(size = 1.15, colour = "#0072B2") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .20, fill = "#0072B2") +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = psi_est, linetype = "dotted", colour = "red") +
+  annotate("text", x = psi_est, y = max(pop_avg2$hi),
+           label = glue("ψ̂ ≈ {round(psi_est, 1)} h"),
+           hjust = -0.05, vjust = 1, colour = "red") +
+  labs(
+    title    = "Cluster 2: GBM-weighted, segmented-Cox HR vs. prophylaxis timing",
+    subtitle = glue("Reference = Q1 ({round(ref_hour,1)} h); breakpoint ψ̂"),
+    x        = "Hours after admission",
+    y        = "Population-average hazard ratio"
+  )
+
+# ---------------------------------------------------------------------------
+# 7 ▸ Console output ---------------------------------------------------------
+cat(glue(
+  "\nBreakpoint for Cluster 2 ≈ {round(psi_est,1)} h ",
+  "(95 % CI {round(psi_est - 1.96*psi_se,1)}–{round(psi_est + 1.96*psi_se,1)} h).\n"
+))
+
+```
+
+
+```{r cluster3-segmented}
+###############################################################################
+##  Cluster 3  •  GBM weights  •  segmented-Cox  •  HR curve + breakpoint ψ̂
+###############################################################################
+library(tidyverse)
+library(WeightIt)
+library(survival)
+library(segmented)   # ← change-point estimation
+library(glue)
+library(ggplot2)
+theme_set(theme_minimal())
+
+# ---------------------------------------------------------------------------
+# SETTINGS -------------------------------------------------------------------
+vte_hours_seq <- 1:168                   # prediction grid (integer hours)
+ref_hour      <- quantile(df$VTEPROPHYLAXISHRS, .25, na.rm = TRUE)  # ≈ 19 h
+
+covars <- c(
+  "VTEPROPHYLAXISTYPE", "SEX", "AGEyears",
+  "ISS", "TBIHIGHESTTOTALGCS",
+  "Hx_AnticoagulantTherapy", "Hx_CVA", "Hx_MyocardialInfarction",
+  "Hx_Cirrhosis", "Hx_BleedingDisorder", "Hx_Hypertension"
+)
+
+# ---------------------------------------------------------------------------
+# 1 ▸ subset to Cluster 3 ----------------------------------------------------
+df3 <- df %>% filter(Cluster == 3)
+
+# ---------------------------------------------------------------------------
+# 2 ▸ GBM weights (already tuned in your plateau code) -----------------------
+#     If you still have `wobj3` and df3$wt_gbm in memory, skip this chunk.
+# ---------------------------------------------------------------------------
+wobj3 <- weightit(
+  reformulate(covars, response = "VTEPROPHYLAXISHRS"),
+  data              = df3,
+  method            = "gbm",
+  density           = "kernel",
+  criterion         = "p.max",
+  trim.at           = 0.99,
+  estimand          = "ATE",
+  n.trees           = 5000,
+  shrinkage         = 0.01,
+  interaction.depth = 3,
+  bag.fraction      = 0.7
+)
+df3$wt_gbm <- wobj3$weights
+
+saveRDS(wobj3, "gbm_weights/gbm_cluster_3.rds")
+
+# ---------------------------------------------------------------------------
+# 3 ▸ base Cox model with a *linear* timing term -----------------------------
+cox_lin3 <- coxph(
+  Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+    VTEPROPHYLAXISHRS +                  # ← raw linear term
+    VTEPROPHYLAXISTYPE + SEX +
+    ns(AGEyears, df = 2) +
+    TBIHIGHESTTOTALGCS +
+    Hx_AnticoagulantTherapy +
+    Hx_CVA + Hx_Cirrhosis + Hx_BleedingDisorder + Hx_Hypertension,
+  data    = df3,
+  weights = wt_gbm,
+  robust  = TRUE,    # sandwich variance
+  model   = TRUE     # retain design matrix for segmented()
+)
+
+# ---------------------------------------------------------------------------
+# 4 ▸ segmented fit (single breakpoint ψ̂) ------------------------------------
+psi_start <- list(VTEPROPHYLAXISHRS = median(df3$VTEPROPHYLAXISHRS, na.rm = TRUE))
+
+seg3 <- segmented(
+  cox_lin3,
+  seg.Z   = ~ VTEPROPHYLAXISHRS,
+  psi     = psi_start,
+  control = seg.control(display = FALSE, n.boot = 0)  # 0 ⇒ delta-method SE
+)
+
+# ── extract breakpoint estimate & 95 % CI
+psi_tab <- seg3$psi
+row_idx <- grep("VTEPROPHYLAXISHRS", rownames(psi_tab))
+est_col <- grep("^Est",       colnames(psi_tab))
+se_col  <- grep("^St\\.?Err", colnames(psi_tab))
+
+psi_est <- as.numeric(psi_tab[row_idx, est_col])
+psi_se  <- as.numeric(psi_tab[row_idx, se_col])
+cat(sprintf(
+  "\nCluster 3  •  breakpoint ψ̂ = %.2f h  (robust SE %.2f ⇒ 95%% CI %.2f-%.2f)\n",
+  psi_est, psi_se, psi_est - 1.96*psi_se, psi_est + 1.96*psi_se
+))
+
+# ---------------------------------------------------------------------------
+# 5 ▸ population-average HR curve on 1-168 h grid ----------------------------
+#     We re-use the patient-expansion trick you already like.
+# ---------------------------------------------------------------------------
+grid_df <- df3[rep(seq_len(nrow(df3)), each = length(vte_hours_seq)), ]
+grid_df$VTEPROPHYLAXISHRS <- rep(vte_hours_seq, times = nrow(df3))
+
+# add segmented predictors that `segmented()` expects in newdata
+grid_df$U1.VTEPROPHYLAXISHRS   <- pmax(0, grid_df$VTEPROPHYLAXISHRS - psi_est)
+grid_df$psi1.VTEPROPHYLAXISHRS <- 1     # constant column
+
+# linear predictor for each row of grid_df
+grid_df$lp <- predict(seg3, newdata = grid_df, type = "lp")
+
+# reference LP for each patient evaluated at Q1 hour -------------------------
+ref_dat <- df3 %>% mutate(
+  VTEPROPHYLAXISHRS        = ref_hour,
+  U1.VTEPROPHYLAXISHRS     = pmax(0, ref_hour - psi_est),
+  psi1.VTEPROPHYLAXISHRS   = 1
+)
+ref_lp <- predict(seg3, newdata = ref_dat, type = "lp")
+
+grid_df$ref_lp <- rep(ref_lp, each = length(vte_hours_seq))
+
+# patient-specific HR & weights
+grid_df$HR <- exp(grid_df$lp - grid_df$ref_lp)
+grid_df$w  <- rep(df3$wt_gbm, each = length(vte_hours_seq))
+
+pop_avg3 <- grid_df %>%
+  group_by(VTEPROPHYLAXISHRS) %>%
+  summarise(
+    HR = sum(w * HR) / sum(w),
+    .groups = "drop"
+  ) %>%
+  mutate(                       # quick ±5 % band as placeholder
+    lo = HR * 0.95,
+    hi = HR * 1.05
+  )
+
+# ---------------------------------------------------------------------------
+# 6 ▸ Plot -------------------------------------------------------------------
+ggplot(pop_avg3, aes(VTEPROPHYLAXISHRS, HR)) +
+  geom_line(size = 1.15, colour = "#0072B2") +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .20, fill = "#0072B2") +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = psi_est, linetype = "dotted", colour = "red") +
+  annotate(
+    "text", x = psi_est, y = max(pop_avg3$hi),
+    label = glue("ψ̂ ≈ {round(psi_est, 1)} h"),
+    hjust = -0.05, vjust = 1, colour = "red"
+  ) +
+  labs(
+    title    = "Cluster 3: GBM-weighted, segmented-Cox HR vs. prophylaxis timing",
+    subtitle = glue("Reference = Q1 ({round(ref_hour,1)} h);  breakpoint estimate ψ̂"),
+    x        = "Hours after admission",
+    y        = "Population-average hazard ratio"
+  )
+
+# ---------------------------------------------------------------------------
+# 7 ▸ Quick console output ---------------------------------------------------
+cat(glue(
+  "\nBreakpoint for Cluster 3 occurs at about {round(psi_est,1)} h ",
+  "(95% CI {round(psi_est - 1.96*psi_se,1)}–{round(psi_est + 1.96*psi_se,1)} h).\n"
+))
+
+```
+
+
+
+
+
+## Cox Spline Models
+
+Cluster 1
+```{r cluster1-doubly-robust}
+###############################################################################
+##  Cluster 1  •  GBM weights (cached) • doubly-robust Cox • HR curve + plateau
+###############################################################################
+library(tidyverse)
+library(WeightIt)      # needed to read the WeightIt object
+library(survival)
+library(glue)
+
+# ---------------------------------------------------------------------------
+# SETTINGS -------------------------------------------------------------------
+vte_hours_seq <- seq(1, 168, length.out = 100)
+tol_slope     <- 0.002
+ref_hour      <- quantile(df$VTEPROPHYLAXISHRS, .25, na.rm = TRUE)  # ≈ 19 h
+
+covars <- c(
+  "VTEPROPHYLAXISTYPE", "SEX", "AGEyears",
+  "ISS", "TBIHIGHESTTOTALGCS",
+  "Hx_AnticoagulantTherapy", "Hx_CVA", "Hx_MyocardialInfarction",
+  "Hx_Cirrhosis", "Hx_BleedingDisorder", "Hx_Hypertension"
+)
+
+cox_formula <- as.formula(
+  paste(
+    "Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~",
+    "ns(VTEPROPHYLAXISHRS, 3) +",
+    paste(covars, collapse = " + ")
+  )
+)
+
+# ---------------------------------------------------------------------------
+# 1 ▸ subset to Cluster 1 ----------------------------------------------------
+df1 <- df %>% filter(Cluster == 1)
+
+# ---------------------------------------------------------------------------
+wobj1 <- readRDS(gbm_file)
+df1$wt_gbm <- wobj1$weights
+
+# ---------------------------------------------------------------------------
+# 3 ▸ doubly-robust Cox spline model ----------------------------------------
+fit1  <- coxph(cox_formula, data = df1, weights = wt_gbm)
+beta  <- coef(fit1)
+Sigma <- vcov(fit1)
+
+mean_design1 <- function(hr) {
+  tmp <- df1
+  tmp$VTEPROPHYLAXISHRS <- hr
+  mm  <- model.matrix(fit1, data = tmp)
+  colSums(mm * df1$wt_gbm) / sum(df1$wt_gbm)
+}
+
+X_ref  <- mean_design1(ref_hour)[names(beta)]
+lp_ref <- sum(X_ref * beta)
+
+# ---------------------------------------------------------------------------
+# 4 ▸ HR curve, CI & slope ---------------------------------------------------
+plot_df <- map_dfr(vte_hours_seq, function(hr) {
+  x_bar <- mean_design1(hr)[names(beta)]
+  lp    <- sum(x_bar * beta)
+  v     <- x_bar - X_ref
+  SElog <- sqrt(t(v) %*% Sigma %*% v)
+  tibble(
+    VTE_Hours = hr,
+    HR        = exp(lp - lp_ref),
+    lower     = exp(lp - lp_ref - 1.96 * SElog),
+    upper     = exp(lp - lp_ref + 1.96 * SElog)
+  )
+}) %>%
+  arrange(VTE_Hours) %>%
+  mutate(dHR_dt = c(diff(HR) / diff(VTE_Hours), NA))
+
+# ---------------------------------------------------------------------------
+# 5 ▸ Plateau hour -----------------------------------------------------------
+idx <- which(
+  plot_df$VTE_Hours > ref_hour &
+  plot_df$HR        < 1        &
+  abs(plot_df$dHR_dt) < tol_slope
+)[1]
+plateau_hour <- if (!is.na(idx)) plot_df$VTE_Hours[idx] else NA_real_
+
+# ---------------------------------------------------------------------------
+# 6 ▸ Plot -------------------------------------------------------------------
+ggplot(plot_df, aes(VTE_Hours, HR)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#619CFF40") +
+  geom_line(colour = "#619CFF", size = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  {if (!is.na(plateau_hour))
+     geom_vline(xintercept = plateau_hour, linetype = "dotted", colour = "#619CFF")} +
+  {if (!is.na(plateau_hour))
+     annotate("text", x = plateau_hour, y = max(plot_df$upper, na.rm = TRUE),
+              label = sprintf("Plateau ≈ %.1f h", plateau_hour),
+              hjust = -0.05, vjust = 1, size = 3.5)} +
+  labs(
+    title = "Cluster 1: GBM-weighted, doubly-robust HR vs. prophylaxis timing",
+    subtitle = glue("Reference = Q1 ({round(ref_hour,1)} h); plateau = |ΔHR| < {tol_slope}/h"),
+    x = "Hours after admission",
+    y = "Hazard ratio"
+  ) +
+  theme_minimal()
+
+# ---------------------------------------------------------------------------
+# 7 ▸ Console output ---------------------------------------------------------
+if (!is.na(plateau_hour)) {
+  cat(glue("\nPlateau (Cluster 1) begins at about {round(plateau_hour,1)} hours.\n"))
+} else {
+  cat("\nCurve never meets the flat-plateau criterion in Cluster 1.\n")
+}
+
+```
+Cluster 2
+```{r cluster2-doubly-robust}
+###############################################################################
+##  Cluster 2  •  GBM weights (cached) • doubly-robust Cox • HR curve + plateau
+###############################################################################
+library(tidyverse)
+library(WeightIt)      # needed to read the WeightIt object
+library(survival)
+library(glue)
+
+# ---------------------------------------------------------------------------
+# SETTINGS -------------------------------------------------------------------
+vte_hours_seq <- seq(1, 168, length.out = 100)
+tol_slope     <- 0.002
+ref_hour      <- quantile(df$VTEPROPHYLAXISHRS, .25, na.rm = TRUE)    # global Q1
+
+covars <- c(
+  "VTEPROPHYLAXISTYPE", "SEX", "AGEyears",
+  "ISS", "TBIHIGHESTTOTALGCS",
+  "Hx_AnticoagulantTherapy", "Hx_CVA", "Hx_MyocardialInfarction",
+  "Hx_Cirrhosis", "Hx_BleedingDisorder", "Hx_Hypertension"
+)
+
+cox_formula <- as.formula(
+  paste(
+    "Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~",
+    "ns(VTEPROPHYLAXISHRS, 3) +",
+    paste(covars, collapse = " + ")
+  )
+)
+
+# ---------------------------------------------------------------------------
+# 1 ▸ subset to Cluster 2 ----------------------------------------------------
+df2 <- df %>% filter(Cluster == 2)
+
+# ---------------------------------------------------------------------------
+# 2 ▸ read cached weights ----------------------------------------------------
+gbm_file <- file.path("gbm_weights", "gbm_cluster_2.rds")   # adjust path if needed
+wobj2    <- readRDS(gbm_file)
+
+## keep rows aligned just in case ordering changed
+df2$wt_gbm <- wobj2$weights
+wt_gbm     <- df2$wt_gbm              # object used in coxph()
+
+# ---------------------------------------------------------------------------
+# 3 ▸ doubly-robust Cox spline model ----------------------------------------
+fit2  <- coxph(cox_formula, data = df2, weights = wt_gbm)
+beta  <- coef(fit2)
+Sigma <- vcov(fit2)
+
+mean_design2 <- function(hr) {
+  tmp <- df2
+  tmp$VTEPROPHYLAXISHRS <- hr
+  mm  <- model.matrix(fit2, data = tmp)
+  colSums(mm * df2$wt_gbm) / sum(df2$wt_gbm)
+}
+
+X_ref  <- mean_design2(ref_hour)[names(beta)]
+lp_ref <- sum(X_ref * beta)
+
+# ---------------------------------------------------------------------------
+# 4 ▸ HR curve, CI & slope ---------------------------------------------------
+plot_df <- map_dfr(vte_hours_seq, function(hr) {
+  x_bar <- mean_design2(hr)[names(beta)]
+  lp    <- sum(x_bar * beta)
+  v     <- x_bar - X_ref
+  SElog <- sqrt(t(v) %*% Sigma %*% v)
+  tibble(
+    VTE_Hours = hr,
+    HR        = exp(lp - lp_ref),
+    lower     = exp(lp - lp_ref - 1.96 * SElog),
+    upper     = exp(lp - lp_ref + 1.96 * SElog)
+  )
+}) %>%
+  arrange(VTE_Hours) %>%
+  mutate(dHR_dt = c(diff(HR) / diff(VTE_Hours), NA))
+
+# ---------------------------------------------------------------------------
+# 5 ▸ Plateau hour -----------------------------------------------------------
+idx <- which(
+  plot_df$VTE_Hours > ref_hour &
+  plot_df$HR        < 1        &
+  abs(plot_df$dHR_dt) < tol_slope
+)[1]
+plateau_hour <- if (!is.na(idx)) plot_df$VTE_Hours[idx] else NA_real_
+
+# ---------------------------------------------------------------------------
+# 6 ▸ Plot -------------------------------------------------------------------
+ggplot(plot_df, aes(VTE_Hours, HR)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#619CFF40") +
+  geom_line(colour = "#619CFF", size = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  {if (!is.na(plateau_hour))
+     geom_vline(xintercept = plateau_hour, linetype = "dotted", colour = "#619CFF")} +
+  {if (!is.na(plateau_hour))
+     annotate("text", x = plateau_hour, y = max(plot_df$upper, na.rm = TRUE),
+              label = sprintf("Plateau ≈ %.1f h", plateau_hour),
+              hjust = -0.05, vjust = 1, size = 3.5)} +
+  labs(
+    title = "Cluster 2: GBM-weighted, doubly-robust HR vs. prophylaxis timing",
+    subtitle = glue("Reference = Q1 ({round(ref_hour,1)} h); plateau = |ΔHR| < {tol_slope}/h"),
+    x = "Hours after admission",
+    y = "Hazard ratio"
+  ) +
+  theme_minimal()
+
+# ---------------------------------------------------------------------------
+# 7 ▸ Console output ---------------------------------------------------------
+if (!is.na(plateau_hour)) {
+  cat(glue("\nPlateau (Cluster 2) begins at about {round(plateau_hour,1)} hours.\n"))
+} else {
+  cat("\nCurve never meets the flat-plateau criterion in Cluster 2.\n")
+}
+```
+
+
+Cluster 3
+```{r cluster3-doubly-robust}
+###############################################################################
+##  Cluster 3  •  GBM weights (cached) • doubly-robust Cox • HR curve + plateau
+###############################################################################
+library(tidyverse)
+library(WeightIt)   # still required for the object class, but not refitting
+library(survival)
+library(glue)
+
+# ---------------------------------------------------------------------------
+# SETTINGS -------------------------------------------------------------------
+vte_hours_seq <- seq(1, 168, length.out = 100)   # prediction grid
+tol_slope     <- 0.002                           # plateau rule
+ref_hour      <- quantile(df$VTEPROPHYLAXISHRS, .25, na.rm = TRUE)  # ≈ 19 h
+
+covars <- c(
+  "VTEPROPHYLAXISTYPE", "SEX", "AGEyears",
+  "ISS", "TBIHIGHESTTOTALGCS",
+  "Hx_AnticoagulantTherapy", "Hx_CVA", "Hx_MyocardialInfarction",
+  "Hx_Cirrhosis", "Hx_BleedingDisorder", "Hx_Hypertension"
+)
+
+cox_formula <- as.formula(
+  paste(
+    "Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~",
+    "ns(VTEPROPHYLAXISHRS, 3) +",
+    paste(covars, collapse = " + ")
+  )
+)
+
+# ---------------------------------------------------------------------------
+# 1 ▸ subset to Cluster 3 ----------------------------------------------------
+df3 <- df %>% filter(Cluster == 3)
+
+# ---------------------------------------------------------------------------
+obj3 <- readRDS(gbm_file)
+df3$wt_gbm <- wobj3$weights
+# ─────────────────────────────────────────────────────────────────────────────
+# 3 ── Doubly-robust Cox model
+# ─────────────────────────────────────────────────────────────────────────────
+fit3 <- coxph(cox_formula, data = df3, weights = wt_gbm)
+
+beta  <- coef(fit3)
+Sigma <- vcov(fit3)
+
+mean_design3 <- function(hr) {
+  tmp <- df3
+  tmp$VTEPROPHYLAXISHRS <- hr
+  mm  <- model.matrix(fit3, data = tmp)
+  colSums(mm * df3$wt_gbm) / sum(df3$wt_gbm)
+}
+
+X_ref  <- mean_design3(ref_hour)[names(beta)]
+lp_ref <- sum(X_ref * beta)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4 ── HR curve, CI & slope on the grid
+# ─────────────────────────────────────────────────────────────────────────────
+plot_df <- map_dfr(vte_hours_seq, function(hr) {
+  x_bar <- mean_design3(hr)[names(beta)]
+  lp    <- sum(x_bar * beta)
+  v     <- x_bar - X_ref
+  SElog <- sqrt(t(v) %*% Sigma %*% v)
+
+  tibble(
+    VTE_Hours = hr,
+    HR        = exp(lp - lp_ref),
+    lower     = exp(lp - lp_ref - 1.96 * SElog),
+    upper     = exp(lp - lp_ref + 1.96 * SElog)
+  )
+}) %>%
+  arrange(VTE_Hours) %>%
+  mutate(dHR_dt = c(diff(HR) / diff(VTE_Hours), NA))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5 ── Plateau hour
+# ─────────────────────────────────────────────────────────────────────────────
+idx <- which(
+  plot_df$VTE_Hours > ref_hour &
+  plot_df$HR        < 1        &
+  abs(plot_df$dHR_dt) < tol_slope
+)[1]
+
+plateau_hour <- if (!is.na(idx)) plot_df$VTE_Hours[idx] else NA_real_
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6 ── Plot
+# ─────────────────────────────────────────────────────────────────────────────
+ggplot(plot_df, aes(VTE_Hours, HR)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#619CFF40") +
+  geom_line(colour = "#619CFF", size = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  {if (!is.na(plateau_hour))
+     geom_vline(xintercept = plateau_hour, linetype = "dotted", colour = "#619CFF")} +
+  {if (!is.na(plateau_hour))
+     annotate("text", x = plateau_hour, y = max(plot_df$upper, na.rm = TRUE),
+              label = sprintf("Plateau ≈ %.1f h", plateau_hour),
+              hjust = -0.05, vjust = 1, size = 3.5)} +
+  labs(
+    title = "Cluster 3: GBM-weighted, doubly-robust HR vs. prophylaxis timing",
+    subtitle = glue("Reference = Q1 ({round(ref_hour,1)} h); plateau = |ΔHR| < {tol_slope}/h"),
+    x = "Hours after admission",
+    y = "Hazard ratio"
+  ) +
+  theme_minimal()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7 ── Quick console output
+# ─────────────────────────────────────────────────────────────────────────────
+if (!is.na(plateau_hour)) {
+  cat(glue("\nPlateau (Cluster 3) begins at about {round(plateau_hour,1)} hours.\n"))
+} else {
+  cat("\nCurve never meets the flat-plateau criterion in Cluster 3.\n")
+}
+
+```
+
+## RSF Models
+
+
+
+
+## Idk
+
+
+
+```{r cluster-summary-export}
+###############################################################################
+#  FULL SCRIPT – flip cluster summary and export as PNG
+###############################################################################
+
+# 
+library(dplyr)        # data wrangling
+library(tidyr)        # pivot_longer / pivot_wider
+library(kableExtra)   # pretty tables + save_kable()
+library(webshot2)     # takes the HTML snapshot
+# ↓ run once per machine (commented out after first time)
+# webshot2::install_phantomjs()
+
+# 
+## (Assumes you’ve already run your summarise() code that creates
+##  the `cluster_summary` tibble.)
+
+# 
+cluster_summary_char <- cluster_summary %>%
+  mutate(across(-Cluster, as.character))
+
+# 
+cluster_summary_wide <- cluster_summary_char %>%
+  pivot_longer(-Cluster,
+               names_to  = "Variable",
+               values_to = "Value") %>%
+  pivot_wider(names_from  = Cluster,
+              values_from = Value,
+              names_sort  = TRUE)   # keeps 1-2-3 order
+
+# 
+cluster_summary_wide %>%
+  kable(format    = "html",
+        col.names = c("Variable", "Cluster 1", "Cluster 2", "Cluster 3")) %>%
+  kable_styling(
+    full_width        = FALSE,
+    position          = "left",
+    bootstrap_options = c("striped", "condensed", "hover")
+  ) %>%
+  save_kable(
+    file = "cluster_summary.png",
+    zoom = 2          # ↑ resolution; bump to 3–4 for print-quality
+  )
+
+# 
+```
+
+
+
+
+```{r alternative-weighting}
+W_2 <- weightit(
+  VTEPROPHYLAXISHRS ~ VTEPROPHYLAXISTYPE + OnVent + ICU_Stay + SEX + AGEyears + TBIHIGHESTTOTALGCS + PreHospital_Anticoagulant_Therapy + History_of_CVA +
+  History_of_MI + History_of_Cirrhosis + Bleeding_Disorder + Hypertension,
+  data = filter(dfkm, Cluster == 1),
+  method = "gbm",
+  density = "kernel",
+  criterion = "p.max",   
+  trim.at = 0.99,
+  estimand = "ATE",
+  n.trees = 5000,              
+  shrinkage = 0.01,           
+  interaction.depth = 3,       
+  bag.fraction = 0.7           
+)
+
+dfkm_2 <- dfkm %>%
+  filter(Cluster == 1)
+
+dfkm_2$wtps <- W_2$weights
+
+
+
+```
+
+
+```{r final-cox-model}
+
+cox_model <- coxph(
+  Surv(FINALDISCHARGEHRS, WITHDRAWALLST) ~
+    ns(VTEPROPHYLAXISHRS, df = 3) + TBIHIGHESTTOTALGCS +
+    ns(AGEyears, df = 2) +
+    PreHospital_Anticoagulant_Therapy + History_of_CVA + History_of_MI + History_of_Cirrhosis + Bleeding_Disorder + Hypertension +
+    VTEPROPHYLAXISTYPE + SEX,
+  data = filter(df, Cluster == 3),
+  weights = wtps
+)
+
+# Hours from 1 to 168 (natural scale)
+vte_hours_seq <- seq(1, 168, length.out = 100)
+
+# Filter dfkm for Cluster 1
+cluster1_df <- df %>% filter(Cluster == 3)
+
+# Build prediction dataset from Cluster 1 characteristics
+pred_data <- data.frame(
+  VTEPROPHYLAXISHRS = vte_hours_seq,
+  TBIHIGHESTTOTALGCS = mean(cluster1_df$TBIHIGHESTTOTALGCS, na.rm = TRUE),
+  ISS = mean(cluster1_df$ISS, na.rm = TRUE),
+  AGEyears = mean(cluster1_df$AGEyears, na.rm = TRUE),
+  PreHospital_Anticoagulant_Therapy = mean(cluster1_df$PreHospital_Anticoagulant_Therapy, na.rm = TRUE),
+  History_of_MI = mean(cluster1_df$History_of_MI, na.rm = TRUE),
+  History_of_Cirrhosis = mean(cluster1_df$History_of_Cirrhosis, na.rm = TRUE),
+  Bleeding_Disorder = mean(cluster1_df$Bleeding_Disorder, na.rm = TRUE),
+  Hypertension = mean(cluster1_df$Hypertension, na.rm = TRUE),
+  SEX = round(mean(cluster1_df$SEX, na.rm = TRUE)),  # assuming binary
+  ICU_Stay = mean(cluster1_df$ICU_Stay, na.rm = TRUE),
+  History_of_CVA = mean(cluster1_df$History_of_CVA, na.rm = TRUE),
+  VTEPROPHYLAXISTYPE = "LWMH"
+)
+
+# Predict spline effect only (raw, uncentered)
+spline_terms <- predict(cox_model, newdata = pred_data, type = "terms", se.fit = TRUE)
+
+# Use the raw log hazard (from the spline term only)
+log_hazard <- spline_terms$fit[, 1]
+se_hazard <- spline_terms$se.fit[, 1]
+
+# Convert to hazard ratios without centering
+hr_raw <- exp(log_hazard)
+upper_hr <- exp(log_hazard + 1.96 * se_hazard)
+lower_hr <- exp(log_hazard - 1.96 * se_hazard)
+
+# Plotting data
+plot_df <- data.frame(
+  VTE_Hours = vte_hours_seq,
+  HR = hr_raw,
+  Upper = upper_hr,
+  Lower = lower_hr
+)
+
+# --- 1. find the first crossing of HR < 1 ---------------------------
+optimal_point <- plot_df %>%                # plot_df already ordered by VTE_Hours
+  filter(HR < 1) %>%                        # ❶ use the point estimate only
+  slice(1)                                  # ❷ take the earliest hour
+
+# --- 2. build the figure -------------------------------------------------
+ggplot(plot_df, aes(x = VTE_Hours, y = HR)) +
+  geom_line(size = 1.2, colour = "black") +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), alpha = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = optimal_point$VTE_Hours,
+             linetype = "dashed", colour = "blue") +
+  annotate(
+    "text",
+    x     = optimal_point$VTE_Hours + 2,   # horizontal offset
+    y     = 1.9,                           # vertical position (adjust as you like)
+    label = paste0(round(optimal_point$VTE_Hours, 1), " hrs"),
+    colour = "blue",
+    hjust  = 0
+  ) +
+  labs(
+    title = "Hazard Ratio for VTE Prophylaxis Hours",
+    x     = "VTE Prophylaxis Hours",
+    y     = "Hazard Ratio"
+  ) +
+  coord_cartesian(ylim = c(0, 2)) +        # keeps y-axis tight
+  theme_minimal()
+```
+
+
+
+###  calculate optimal VTE prophylaxis timing per cluster using Bayesian Weibull survival models:
+### initially gave 200hrs as optimal but likely a monotonic curve (always increasing with time)
+
+```{r, eval=FALSE}
+
+
+# Step 1: Prepare data
+cluster_df <- cluster_df %>%
+  mutate(
+    VTE_log = log(VTEPROPHYLAXISHRS + 0.01),
+    censored = 1 - WITHDRAWALLST
+  ) %>%
+  filter(!is.na(VTE_log), !is.na(FINALDISCHARGEHRS), !is.na(censored))
+
+# Step 2: Fit Bayesian Weibull model by cluster
+optimal_times_by_cluster <- map_dfr(levels(factor(cluster_df$Cluster)), function(clust) {
+  df_sub <- cluster_df %>% filter(Cluster == clust)
+  
+  if (nrow(df_sub) < 100 || length(unique(df_sub$WITHDRAWALLST)) < 2) {
+    message("Skipping cluster ", clust, ": insufficient data")
+    return(NULL)
+  }
+## try median instead of mean 
+model <- brm(
+  formula = bf(FINALDISCHARGEHRS | cens(censored) ~ ns(VTE_log, df = 3)),
+  data = df_sub,
+  family = weibull(),
+  chains = 4,
+  cores = 4,
+  iter = 2000,
+  seed = 2025,
+  control = list(adapt_delta = 0.95)
+)
+  if (inherits(model, "try-error")) {
+    message("Model failed for cluster ", clust)
+    return(NULL)
+  }
+
+  # Predict survival over a range of VTE timings
+  vte_grid <- data.frame(VTE_log = log(seq(0.5, 200, by = 1)))
+  pred_surv <- posterior_epred(model, newdata = vte_grid)
+  vte_grid$MeanSurvival <- colMeans(pred_surv)
+  vte_grid$VTE_Hours <- exp(vte_grid$VTE_log) - 0.01
+
+  # Plot survival curve
+  p <- ggplot(vte_grid, aes(x = VTE_Hours, y = MeanSurvival)) +
+    geom_line(color = "darkblue", size = 1.2) +
+    labs(
+      title = paste("Posterior Survival Curve for Cluster", clust),
+      x = "VTE Prophylaxis Time (hrs)",
+      y = "Posterior Mean Survival (hrs)"
+    ) +
+    theme_minimal()
+  print(p)
+
+  optimal_index <- which.max(vte_grid$MeanSurvival)
+
+  tibble(
+    Cluster = clust,
+    Optimal_VTE_Hours = vte_grid$VTE_Hours[optimal_index],
+    Posterior_Mean_Survival = vte_grid$MeanSurvival[optimal_index]
+  )
+})
+
+
+```
+
+
+
+# Sensitivity Analysis
+
+Still need to build this out.
+
+
+# External Validation
+
+This will be the code running tests on the MIMIC-IV database

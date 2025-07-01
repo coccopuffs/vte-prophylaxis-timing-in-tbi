@@ -53,6 +53,23 @@ library(tableone)
 library(cobalt)
 library(segmented)
 library(parallel)
+library(corrplot)
+library(survminer)
+library(tableone)
+library(flextable)
+library(officer)
+library(gbm)
+library(boot)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(future.apply)
+library(randomForestSRC)
+library(WeightIt)
+library(glue)
+library(patchwork)
+library(kableExtra)   
+library(webshot2) 
 
 select <- dplyr::select
 start <- fread("df_clean.csv")
@@ -64,8 +81,50 @@ start <- fread("df_clean.csv")
 
 We extracted all admission-day covariates that may confound the association between prophylaxis initiation time and outcomes including: GCS, ISS, age, documented hyper- or hypocoagulable disorders, etc... All-cause mortality serves as the primary endpoint because its exact occurrence can be aligned with the recorded time of VTE prophylaxis initiation. Secondary endpoints (pulmonary embolism, deep-vein thrombosis, and myocardial infarction) are also captured to characterize how event rates vary across the initiation timeline.
 
-```{r, echo = FALSE}
-df <- start
+```{r data-prep, echo = FALSE}
+df <- start %>% 
+  # recode 2 → 0 for binary variables
+  mutate(across(
+    c(SEX, WITHDRAWALLST, TBIMIDLINESHIFT,
+      RESPIRATORYASSISTANCE, SUPPLEMENTALOXYGEN,
+      INTERFACILITYTRANSFER, PREHOSPITALCARDIACARREST, DEATHINED, BLOODMEASURE),
+    ~ ifelse(.x == 2, 0, .x)
+  )) %>% 
+  # apply cohort filters
+  filter(
+    SEX != 3,
+    TBIMIDLINESHIFT != 3,
+    VTEPROPHYLAXISTYPE %in% c("LWMH", "Unfractionated Heparin"),
+    VTEPROPHYLAXISHRS < 168
+  ) %>% 
+  
+  # set reference level for prophylaxis type
+  mutate(
+    VTEPROPHYLAXISTYPE = relevel(factor(VTEPROPHYLAXISTYPE),
+                                 ref = "Unfractionated Heparin")
+  ) %>%
+
+  mutate(
+    BLOOD4ML = case_when(
+      BLOODMEASURE == 1              ~ BLOOD4HOURS * BLOODCONVERSION,  # entered as units
+      BLOODMEASURE == 0              ~ BLOOD4HOURS,                    # already mL
+      is.na(BLOODMEASURE)            ~ BLOOD4HOURS * 300,              # assume 300 mL per unit
+      TRUE                           ~ NA_real_                        # fall-back, should be rare
+    )
+  ) %>% 
+  filter(BLOOD4ML <= 12500)
+
+cols_to_zero <- c(
+  "TOTALVENTDAYS", "TOTALICULOS",
+  "HE_UnplannedIntubation", "HE_Stroke.CVA", "HE_SevereSepsis",
+  "HE_DVT", "HE_UnplannedAdmissiontoICU", "HE_UnplannedVisittoOR",
+  "Hx_Pregnancy", "BLOOD4ML"
+)
+
+df <- df %>% mutate(across(everything(), ~ suppressWarnings(as.numeric(.x))))
+
+df <- df %>% 
+  mutate(across(all_of(cols_to_zero), ~ replace_na(.x, 0)))
 ```
 
 ## Missingness Analysis
@@ -103,14 +162,199 @@ missing_table <- df %>%
   arrange(desc(Missing_Count))
 
 kable(missing_table)
+ 
+missing_summary <- df %>%
+  summarise_all(~sum(is.na(.))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(
+    Total_N = nrow(df),
+    Missing_Percent = round(100 * Missing_Count / Total_N, 2)
+  ) %>%
+  arrange(desc(Missing_Percent))
+
+high_missing_vars <- missing_summary %>%
+  filter(Missing_Percent > 10) %>%
+  pull(Variable)
+
+df_vte_analysis <- df %>%
+  mutate(
+    vte_type_missing = is.na(VTEPROPHYLAXISTYPE),
+    vte_type_empty = (VTEPROPHYLAXISTYPE == "" | VTEPROPHYLAXISTYPE == " "),
+    vte_timing_missing = is.na(VTEPROPHYLAXISHRS),
+    vte_any_missing = vte_type_missing | vte_type_empty | vte_timing_missing
+  )
+
+vte_missing_summary <- df_vte_analysis %>%
+  summarise(
+    total_patients = n(),
+    type_missing = sum(vte_type_missing, na.rm = TRUE),
+    type_empty = sum(vte_type_empty, na.rm = TRUE),
+    timing_missing = sum(vte_timing_missing, na.rm = TRUE),
+    any_vte_missing = sum(vte_any_missing, na.rm = TRUE)
+  ) %>%
+  mutate(
+    pct_type_missing = round(100 * type_missing / total_patients, 1),
+    pct_type_empty = round(100 * type_empty / total_patients, 1),
+    pct_timing_missing = round(100 * timing_missing / total_patients, 1),
+    pct_any_missing = round(100 * any_vte_missing / total_patients, 1)
+  )
+
+vte_mechanism_test <- df %>%
+  mutate(
+    vte_data_available = !is.na(VTEPROPHYLAXISTYPE) & 
+                        VTEPROPHYLAXISTYPE != "" & 
+                        !is.na(VTEPROPHYLAXISHRS)
+  )
+
+test_vars <- c("AGEyears", "SEX", "TBIHIGHESTTOTALGCS", "TOTALICULOS", 
+               "TOTALVENTDAYS", "FINALDISCHARGEHRS", "WITHDRAWALLST")
+
+mechanism_results <- data.frame()
+
+for(var in test_vars) {
+  if(var %in% names(df)) {
+    available_data <- df[vte_mechanism_test$vte_data_available == TRUE, ..var][[1]]
+    missing_data <- df[vte_mechanism_test$vte_data_available == FALSE, ..var][[1]]
+    
+    available_clean <- available_data[!is.na(available_data)]
+    missing_clean <- missing_data[!is.na(missing_data)]
+    
+    if(length(available_clean) > 10 & length(missing_clean) > 10) {
+      if(var %in% c("SEX", "WITHDRAWALLST")) {
+        contingency <- table(
+          Group = c(rep("Available", length(available_clean)), 
+                   rep("Missing", length(missing_clean))),
+          Value = c(available_clean, missing_clean)
+        )
+        
+        if(min(contingency) >= 5) {
+          chi_test <- chisq.test(contingency)
+          effect_size <- sqrt(chi_test$statistic / sum(contingency))
+          
+          mechanism_results <- rbind(mechanism_results, data.frame(
+            Variable = var,
+            Available_Mean = mean(available_clean),
+            Missing_Mean = mean(missing_clean),
+            P_Value = chi_test$p.value,
+            Effect_Size = as.numeric(effect_size)
+          ))
+        }
+      } else {
+        t_test <- t.test(available_clean, missing_clean)
+        pooled_sd <- sqrt(((length(available_clean) - 1) * var(available_clean) + 
+                          (length(missing_clean) - 1) * var(missing_clean)) / 
+                         (length(available_clean) + length(missing_clean) - 2))
+        cohens_d <- abs(mean(available_clean) - mean(missing_clean)) / pooled_sd
+        
+        mechanism_results <- rbind(mechanism_results, data.frame(
+          Variable = var,
+          Available_Mean = round(mean(available_clean), 2),
+          Missing_Mean = round(mean(missing_clean), 2),
+          P_Value = t_test$p.value,
+          Effect_Size = round(cohens_d, 3)
+        ))
+      }
+    }
+  }
+}
+
+if (nrow(mechanism_results) > 0) {
+  mechanism_results <- mechanism_results %>%
+    mutate(
+      Significance = case_when(
+        P_Value < 0.001 ~ "***",
+        P_Value < 0.01 ~ "**", 
+        P_Value < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      MNAR_Evidence = case_when(
+        Effect_Size < 0.2 ~ "Weak",
+        Effect_Size < 0.5 ~ "Moderate",
+        Effect_Size < 0.8 ~ "Strong", 
+        TRUE ~ "Very Strong"
+      )
+    )
+  
+  mnar_evidence <- sum(mechanism_results$P_Value < 0.05, na.rm = TRUE)
+} else {
+  mnar_evidence <- 0
+}
+
+total_tests <- nrow(mechanism_results)
+
+kable(missing_summary %>% head(20), caption = "Missing Data Summary - Top 20 Variables")
+kable(vte_missing_summary, caption = "VTE Prophylaxis Missing Data")
+kable(mechanism_results, caption = "Missing Data Mechanism Assessment")
 ```
 
 ## Variable Distribution + Outliers
 Can you check for outliers in the data
 specifically vteprophylaxishrs, ISS, TBIHIGHESTTOTALGCS
 
-```{r}
+```{r outlier-detection}
+detect_statistical_outliers <- function(x, method = "iqr", z_threshold = 3) {
+  if (method == "z_score") {
+    z_scores <- abs(scale(x))
+    return(which(z_scores > z_threshold))
+  } else if (method == "iqr") {
+    q1 <- quantile(x, 0.25, na.rm = TRUE)
+    q3 <- quantile(x, 0.75, na.rm = TRUE)
+    iqr <- q3 - q1
+    lower_bound <- q1 - 1.5 * iqr
+    upper_bound <- q3 + 1.5 * iqr
+    return(which(x < lower_bound | x > upper_bound))
+  }
+}
 
+continuous_vars <- c("AGEyears", "TBIHIGHESTTOTALGCS", "TOTALICULOS", 
+                    "TOTALVENTDAYS", "FINALDISCHARGEHRS", "VTEPROPHYLAXISHRS", 
+                    "BLOOD4ML", "ISS")
+
+available_continuous <- intersect(continuous_vars, names(df))
+
+outlier_summary <- data.frame()
+
+for (var in available_continuous) {
+  var_data <- df[[var]][!is.na(df[[var]])]
+  
+  if (length(var_data) > 10) {
+    iqr_outliers <- detect_statistical_outliers(var_data, "iqr")
+    z_outliers <- detect_statistical_outliers(var_data, "z_score", 3)
+    
+    outlier_summary <- rbind(outlier_summary, data.frame(
+      variable = var,
+      n_observations = length(var_data),
+      mean_val = round(mean(var_data), 2),
+      sd_val = round(sd(var_data), 2),
+      median_val = round(median(var_data), 2),
+      q25_val = round(quantile(var_data, 0.25), 2),
+      q75_val = round(quantile(var_data, 0.75), 2),
+      iqr_outliers = length(iqr_outliers),
+      z_outliers = length(z_outliers),
+      outlier_rate = round(100 * length(iqr_outliers) / length(var_data), 2)
+    ))
+  }
+}
+
+key_vars <- c("VTEPROPHYLAXISHRS", "ISS", "TBIHIGHESTTOTALGCS")
+plot_list <- list()
+for (var in key_vars) {
+  if (var %in% names(df)) {
+    p <- ggplot(df, aes_string(y = var)) +
+      geom_boxplot(outlier.color = "red", outlier.alpha = 0.6) +
+      labs(title = paste("Distribution of", var), y = var) +
+      theme_minimal() +
+      theme(axis.text.x = element_blank())
+    
+    plot_list[[var]] <- p
+  }
+}
+
+if (length(plot_list) > 0) {
+  grid.arrange(grobs = plot_list, ncol = 3)
+}
+
+kable(outlier_summary, caption = "Outlier Detection Summary")
 ```
 
 ## Data Consistency + Logical Checks
@@ -118,16 +362,316 @@ can you include common checks
 - pregnancy and female
 - other things like this
 
-```{r}
+```{r data-quality-checks}
+clinical_issues <- data.frame(
+  patient_id = numeric(),
+  issue_type = character(),
+  severity = character(),
+  stringsAsFactors = FALSE
+)
+issues_found <- 0
 
+if ("AGEyears" %in% names(df)) {
+  negative_age <- which(df$AGEyears < 0)
+  extreme_age <- which(df$AGEyears > 120)
+  
+  for (i in c(negative_age, extreme_age)) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = ifelse(i %in% negative_age, "Negative_Age", "Extreme_Age"),
+      severity = ifelse(i %in% negative_age, "Critical", "Warning")
+    )
+  }
+}
+
+if ("TBIHIGHESTTOTALGCS" %in% names(df)) {
+  invalid_gcs <- which(df$TBIHIGHESTTOTALGCS < 3 | df$TBIHIGHESTTOTALGCS > 15)
+  
+  for (i in invalid_gcs) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "Invalid_GCS",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("FINALDISCHARGEHRS" %in% names(df) && "VTEPROPHYLAXISHRS" %in% names(df)) {
+  late_vte <- which(!is.na(df$VTEPROPHYLAXISHRS) & 
+                   !is.na(df$FINALDISCHARGEHRS) &
+                   df$VTEPROPHYLAXISHRS > df$FINALDISCHARGEHRS)
+  
+  for (i in late_vte) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "VTE_After_Discharge",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("TOTALICULOS" %in% names(df) && "FINALDISCHARGEHRS" %in% names(df)) {
+  icu_exceed <- which(!is.na(df$TOTALICULOS) & 
+                     !is.na(df$FINALDISCHARGEHRS) &
+                     df$TOTALICULOS > (df$FINALDISCHARGEHRS / 24))
+  
+  for (i in icu_exceed) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "ICU_Exceeds_Hospital",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("SEX" %in% names(df) && "Hx_Pregnancy" %in% names(df)) {
+  male_pregnancy <- which(df$SEX == 1 & df$Hx_Pregnancy == 1)
+  
+  for (i in male_pregnancy) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "Male_Pregnancy",
+      severity = "Critical"
+    )
+  }
+}
+
+if (issues_found > 0) {
+  issue_summary <- clinical_issues %>%
+    group_by(issue_type, severity) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    arrange(desc(count))
+  
+  critical_patients <- unique(clinical_issues$patient_id[clinical_issues$severity == "Critical"])
+  
+  if (length(critical_patients) > 0) {
+    df_clean <- df[-critical_patients, ]
+  } else {
+    df_clean <- df
+  }
+  
+  kable(issue_summary, caption = "Clinical Data Quality Issues")
+} else {
+  df_clean <- df
+}
+```
+
+## Data Consistency + Logical Checks
+can you include common checks
+- pregnancy and female
+- other things like this
+
+```{r data-quality-checks}
+clinical_issues <- data.frame(
+  patient_id = numeric(),
+  issue_type = character(),
+  severity = character(),
+  stringsAsFactors = FALSE
+)
+issues_found <- 0
+
+if ("AGEyears" %in% names(df)) {
+  negative_age <- which(df$AGEyears < 0)
+  extreme_age <- which(df$AGEyears > 120)
+  
+  for (i in c(negative_age, extreme_age)) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = ifelse(i %in% negative_age, "Negative_Age", "Extreme_Age"),
+      severity = ifelse(i %in% negative_age, "Critical", "Warning")
+    )
+  }
+}
+
+if ("TBIHIGHESTTOTALGCS" %in% names(df)) {
+  invalid_gcs <- which(df$TBIHIGHESTTOTALGCS < 3 | df$TBIHIGHESTTOTALGCS > 15)
+  
+  for (i in invalid_gcs) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "Invalid_GCS",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("FINALDISCHARGEHRS" %in% names(df) && "VTEPROPHYLAXISHRS" %in% names(df)) {
+  late_vte <- which(!is.na(df$VTEPROPHYLAXISHRS) & 
+                   !is.na(df$FINALDISCHARGEHRS) &
+                   df$VTEPROPHYLAXISHRS > df$FINALDISCHARGEHRS)
+  
+  for (i in late_vte) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "VTE_After_Discharge",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("TOTALICULOS" %in% names(df) && "FINALDISCHARGEHRS" %in% names(df)) {
+  icu_exceed <- which(!is.na(df$TOTALICULOS) & 
+                     !is.na(df$FINALDISCHARGEHRS) &
+                     df$TOTALICULOS > (df$FINALDISCHARGEHRS / 24))
+  
+  for (i in icu_exceed) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "ICU_Exceeds_Hospital",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("SEX" %in% names(df) && "Hx_Pregnancy" %in% names(df)) {
+  male_pregnancy <- which(df$SEX == 1 & df$Hx_Pregnancy == 1)
+  
+  for (i in male_pregnancy) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "Male_Pregnancy",
+      severity = "Critical"
+    )
+  }
+}
+
+if (issues_found > 0) {
+  issue_summary <- clinical_issues %>%
+    group_by(issue_type, severity) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    arrange(desc(count))
+  
+  critical_patients <- unique(clinical_issues$patient_id[clinical_issues$severity == "Critical"])
+  
+  if (length(critical_patients) > 0) {
+    df_clean <- df[-critical_patients, ]
+  } else {
+    df_clean <- df
+  }
+  
+  kable(issue_summary, caption = "Clinical Data Quality Issues")
+} else {
+  df_clean <- df
+}
 ```
 
 ## Colinearty check
 Can you run these tests again
 
-```{r}
+```{r correlation-analysis}
+library(corrplot)
 
-```
+df_for_correlation <- if(exists("df_clean")) df_clean else df
+
+numeric_vars <- df_for_correlation %>%
+  select_if(is.numeric) %>%
+  names()
+
+correlation_data <- df_for_correlation[, numeric_vars, with = FALSE]
+correlation_matrix <- cor(correlation_data, use = "pairwise.complete.obs", method = "spearman")
+
+high_correlations <- data.frame(
+  var1 = character(),
+  var2 = character(),
+  correlation = numeric(),
+  abs_correlation = numeric(),
+  stringsAsFactors = FALSE
+)
+correlation_pairs <- 0
+
+for (i in 1:(length(numeric_vars)-1)) {
+  for (j in (i+1):length(numeric_vars)) {
+    var1 <- numeric_vars[i]
+    var2 <- numeric_vars[j]
+    corr_val <- correlation_matrix[i, j]
+    
+    if (!is.na(corr_val) && abs(corr_val) > 0.8) {
+      correlation_pairs <- correlation_pairs + 1
+      high_correlations[correlation_pairs, ] <- data.frame(
+        var1 = var1,
+        var2 = var2,
+        correlation = round(corr_val, 3),
+        abs_correlation = round(abs(corr_val), 3)
+      )
+    }
+  }
+}
+
+if (correlation_pairs > 0) {
+  high_correlations <- high_correlations %>%
+    arrange(desc(abs_correlation))
+  
+  variables_to_exclude <- character()
+  
+  for (i in 1:nrow(high_correlations)) {
+    var1 <- high_correlations$var1[i]
+    var2 <- high_correlations$var2[i]
+    
+    if (var1 %in% variables_to_exclude || var2 %in% variables_to_exclude) {
+      next
+    }
+    
+    if (var1 == "FINALDISCHARGEHRS" && var2 == "HOSPITALDISCHARGEHRS") {
+      variables_to_exclude <- c(variables_to_exclude, "HOSPITALDISCHARGEHRS")
+    } else if (var1 == "BLOOD4ML" && grepl("BLOOD4HOURS", var2)) {
+      variables_to_exclude <- c(variables_to_exclude, var2)
+    } else {
+      missing1 <- sum(is.na(df_for_correlation[[var1]]))
+      missing2 <- sum(is.na(df_for_correlation[[var2]]))
+      
+      if (missing1 <= missing2) {
+        variables_to_exclude <- c(variables_to_exclude, var2)
+      } else {
+        variables_to_exclude <- c(variables_to_exclude, var1)
+      }
+    }
+  }
+  
+  final_variables <- setdiff(numeric_vars, variables_to_exclude)
+} else {
+  final_variables <- numeric_vars
+  variables_to_exclude <- character()
+}
+
+if (length(final_variables) > 1 && length(final_variables) <= 20) {
+  final_corr_matrix <- cor(df_for_correlation[, final_variables, with = FALSE], 
+                          use = "pairwise.complete.obs", method = "spearman")
+  
+  corrplot(final_corr_matrix, 
+           method = "color",
+           type = "upper",
+           order = "hclust",
+           tl.cex = 0.8,
+           tl.col = "black",
+           tl.srt = 45)
+}
+
+if (length(variables_to_exclude) > 0) {
+  non_numeric_vars <- names(df_for_correlation)[!names(df_for_correlation) %in% numeric_vars]
+  final_all_variables <- c(non_numeric_vars, final_variables)
+  
+  df_selected <- df_for_correlation %>%
+    select(all_of(final_all_variables))
+} else {
+  df_selected <- df_for_correlation
+}
+
+if (correlation_pairs > 0) {
+  kable(high_correlations, caption = "High Correlation Pairs (|r| > 0.8)")
+}
+
+# Save dataset before multiple imputation
+save(df_selected, file = "data/pre_imputation_dataset.RData")
 
 ## Outcome + Event Rate Checks
 Can you check the following things
