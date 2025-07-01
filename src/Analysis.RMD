@@ -291,8 +291,70 @@ kable(mechanism_results, caption = "Missing Data Mechanism Assessment")
 Can you check for outliers in the data
 specifically vteprophylaxishrs, ISS, TBIHIGHESTTOTALGCS
 
-```{r}
+```{r outlier-detection}
+detect_statistical_outliers <- function(x, method = "iqr", z_threshold = 3) {
+  if (method == "z_score") {
+    z_scores <- abs(scale(x))
+    return(which(z_scores > z_threshold))
+  } else if (method == "iqr") {
+    q1 <- quantile(x, 0.25, na.rm = TRUE)
+    q3 <- quantile(x, 0.75, na.rm = TRUE)
+    iqr <- q3 - q1
+    lower_bound <- q1 - 1.5 * iqr
+    upper_bound <- q3 + 1.5 * iqr
+    return(which(x < lower_bound | x > upper_bound))
+  }
+}
 
+continuous_vars <- c("AGEyears", "TBIHIGHESTTOTALGCS", "TOTALICULOS", 
+                    "TOTALVENTDAYS", "FINALDISCHARGEHRS", "VTEPROPHYLAXISHRS", 
+                    "BLOOD4ML", "ISS")
+
+available_continuous <- intersect(continuous_vars, names(df))
+
+outlier_summary <- data.frame()
+
+for (var in available_continuous) {
+  var_data <- df[[var]][!is.na(df[[var]])]
+  
+  if (length(var_data) > 10) {
+    iqr_outliers <- detect_statistical_outliers(var_data, "iqr")
+    z_outliers <- detect_statistical_outliers(var_data, "z_score", 3)
+    
+    outlier_summary <- rbind(outlier_summary, data.frame(
+      variable = var,
+      n_observations = length(var_data),
+      mean_val = round(mean(var_data), 2),
+      sd_val = round(sd(var_data), 2),
+      median_val = round(median(var_data), 2),
+      q25_val = round(quantile(var_data, 0.25), 2),
+      q75_val = round(quantile(var_data, 0.75), 2),
+      iqr_outliers = length(iqr_outliers),
+      z_outliers = length(z_outliers),
+      outlier_rate = round(100 * length(iqr_outliers) / length(var_data), 2)
+    ))
+  }
+}
+
+key_vars <- c("VTEPROPHYLAXISHRS", "ISS", "TBIHIGHESTTOTALGCS")
+plot_list <- list()
+for (var in key_vars) {
+  if (var %in% names(df)) {
+    p <- ggplot(df, aes_string(y = var)) +
+      geom_boxplot(outlier.color = "red", outlier.alpha = 0.6) +
+      labs(title = paste("Distribution of", var), y = var) +
+      theme_minimal() +
+      theme(axis.text.x = element_blank())
+    
+    plot_list[[var]] <- p
+  }
+}
+
+if (length(plot_list) > 0) {
+  grid.arrange(grobs = plot_list, ncol = 3)
+}
+
+kable(outlier_summary, caption = "Outlier Detection Summary")
 ```
 
 ## Data Consistency + Logical Checks
@@ -300,8 +362,207 @@ can you include common checks
 - pregnancy and female
 - other things like this
 
-```{r}
+```{r data-quality-checks}
+clinical_issues <- data.frame(
+  patient_id = numeric(),
+  issue_type = character(),
+  severity = character(),
+  stringsAsFactors = FALSE
+)
+issues_found <- 0
 
+if ("AGEyears" %in% names(df)) {
+  negative_age <- which(df$AGEyears < 0)
+  extreme_age <- which(df$AGEyears > 120)
+  
+  for (i in c(negative_age, extreme_age)) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = ifelse(i %in% negative_age, "Negative_Age", "Extreme_Age"),
+      severity = ifelse(i %in% negative_age, "Critical", "Warning")
+    )
+  }
+}
+
+if ("TBIHIGHESTTOTALGCS" %in% names(df)) {
+  invalid_gcs <- which(df$TBIHIGHESTTOTALGCS < 3 | df$TBIHIGHESTTOTALGCS > 15)
+  
+  for (i in invalid_gcs) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "Invalid_GCS",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("FINALDISCHARGEHRS" %in% names(df) && "VTEPROPHYLAXISHRS" %in% names(df)) {
+  late_vte <- which(!is.na(df$VTEPROPHYLAXISHRS) & 
+                   !is.na(df$FINALDISCHARGEHRS) &
+                   df$VTEPROPHYLAXISHRS > df$FINALDISCHARGEHRS)
+  
+  for (i in late_vte) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "VTE_After_Discharge",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("TOTALICULOS" %in% names(df) && "FINALDISCHARGEHRS" %in% names(df)) {
+  icu_exceed <- which(!is.na(df$TOTALICULOS) & 
+                     !is.na(df$FINALDISCHARGEHRS) &
+                     df$TOTALICULOS > (df$FINALDISCHARGEHRS / 24))
+  
+  for (i in icu_exceed) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "ICU_Exceeds_Hospital",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("SEX" %in% names(df) && "Hx_Pregnancy" %in% names(df)) {
+  male_pregnancy <- which(df$SEX == 1 & df$Hx_Pregnancy == 1)
+  
+  for (i in male_pregnancy) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "Male_Pregnancy",
+      severity = "Critical"
+    )
+  }
+}
+
+if (issues_found > 0) {
+  issue_summary <- clinical_issues %>%
+    group_by(issue_type, severity) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    arrange(desc(count))
+  
+  critical_patients <- unique(clinical_issues$patient_id[clinical_issues$severity == "Critical"])
+  
+  if (length(critical_patients) > 0) {
+    df_clean <- df[-critical_patients, ]
+  } else {
+    df_clean <- df
+  }
+  
+  kable(issue_summary, caption = "Clinical Data Quality Issues")
+} else {
+  df_clean <- df
+}
+```
+
+## Data Consistency + Logical Checks
+can you include common checks
+- pregnancy and female
+- other things like this
+
+```{r data-quality-checks}
+clinical_issues <- data.frame(
+  patient_id = numeric(),
+  issue_type = character(),
+  severity = character(),
+  stringsAsFactors = FALSE
+)
+issues_found <- 0
+
+if ("AGEyears" %in% names(df)) {
+  negative_age <- which(df$AGEyears < 0)
+  extreme_age <- which(df$AGEyears > 120)
+  
+  for (i in c(negative_age, extreme_age)) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = ifelse(i %in% negative_age, "Negative_Age", "Extreme_Age"),
+      severity = ifelse(i %in% negative_age, "Critical", "Warning")
+    )
+  }
+}
+
+if ("TBIHIGHESTTOTALGCS" %in% names(df)) {
+  invalid_gcs <- which(df$TBIHIGHESTTOTALGCS < 3 | df$TBIHIGHESTTOTALGCS > 15)
+  
+  for (i in invalid_gcs) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "Invalid_GCS",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("FINALDISCHARGEHRS" %in% names(df) && "VTEPROPHYLAXISHRS" %in% names(df)) {
+  late_vte <- which(!is.na(df$VTEPROPHYLAXISHRS) & 
+                   !is.na(df$FINALDISCHARGEHRS) &
+                   df$VTEPROPHYLAXISHRS > df$FINALDISCHARGEHRS)
+  
+  for (i in late_vte) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "VTE_After_Discharge",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("TOTALICULOS" %in% names(df) && "FINALDISCHARGEHRS" %in% names(df)) {
+  icu_exceed <- which(!is.na(df$TOTALICULOS) & 
+                     !is.na(df$FINALDISCHARGEHRS) &
+                     df$TOTALICULOS > (df$FINALDISCHARGEHRS / 24))
+  
+  for (i in icu_exceed) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "ICU_Exceeds_Hospital",
+      severity = "Critical"
+    )
+  }
+}
+
+if ("SEX" %in% names(df) && "Hx_Pregnancy" %in% names(df)) {
+  male_pregnancy <- which(df$SEX == 1 & df$Hx_Pregnancy == 1)
+  
+  for (i in male_pregnancy) {
+    issues_found <- issues_found + 1
+    clinical_issues[issues_found, ] <- data.frame(
+      patient_id = i,
+      issue_type = "Male_Pregnancy",
+      severity = "Critical"
+    )
+  }
+}
+
+if (issues_found > 0) {
+  issue_summary <- clinical_issues %>%
+    group_by(issue_type, severity) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    arrange(desc(count))
+  
+  critical_patients <- unique(clinical_issues$patient_id[clinical_issues$severity == "Critical"])
+  
+  if (length(critical_patients) > 0) {
+    df_clean <- df[-critical_patients, ]
+  } else {
+    df_clean <- df
+  }
+  
+  kable(issue_summary, caption = "Clinical Data Quality Issues")
+} else {
+  df_clean <- df
+}
 ```
 
 ## Colinearty check
