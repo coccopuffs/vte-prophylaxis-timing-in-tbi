@@ -162,6 +162,129 @@ missing_table <- df %>%
   arrange(desc(Missing_Count))
 
 kable(missing_table)
+ 
+missing_summary <- df %>%
+  summarise_all(~sum(is.na(.))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(
+    Total_N = nrow(df),
+    Missing_Percent = round(100 * Missing_Count / Total_N, 2)
+  ) %>%
+  arrange(desc(Missing_Percent))
+
+high_missing_vars <- missing_summary %>%
+  filter(Missing_Percent > 10) %>%
+  pull(Variable)
+
+df_vte_analysis <- df %>%
+  mutate(
+    vte_type_missing = is.na(VTEPROPHYLAXISTYPE),
+    vte_type_empty = (VTEPROPHYLAXISTYPE == "" | VTEPROPHYLAXISTYPE == " "),
+    vte_timing_missing = is.na(VTEPROPHYLAXISHRS),
+    vte_any_missing = vte_type_missing | vte_type_empty | vte_timing_missing
+  )
+
+vte_missing_summary <- df_vte_analysis %>%
+  summarise(
+    total_patients = n(),
+    type_missing = sum(vte_type_missing, na.rm = TRUE),
+    type_empty = sum(vte_type_empty, na.rm = TRUE),
+    timing_missing = sum(vte_timing_missing, na.rm = TRUE),
+    any_vte_missing = sum(vte_any_missing, na.rm = TRUE)
+  ) %>%
+  mutate(
+    pct_type_missing = round(100 * type_missing / total_patients, 1),
+    pct_type_empty = round(100 * type_empty / total_patients, 1),
+    pct_timing_missing = round(100 * timing_missing / total_patients, 1),
+    pct_any_missing = round(100 * any_vte_missing / total_patients, 1)
+  )
+
+vte_mechanism_test <- df %>%
+  mutate(
+    vte_data_available = !is.na(VTEPROPHYLAXISTYPE) & 
+                        VTEPROPHYLAXISTYPE != "" & 
+                        !is.na(VTEPROPHYLAXISHRS)
+  )
+
+test_vars <- c("AGEyears", "SEX", "TBIHIGHESTTOTALGCS", "TOTALICULOS", 
+               "TOTALVENTDAYS", "FINALDISCHARGEHRS", "WITHDRAWALLST")
+
+mechanism_results <- data.frame()
+
+for(var in test_vars) {
+  if(var %in% names(df)) {
+    available_data <- df[vte_mechanism_test$vte_data_available == TRUE, ..var][[1]]
+    missing_data <- df[vte_mechanism_test$vte_data_available == FALSE, ..var][[1]]
+    
+    available_clean <- available_data[!is.na(available_data)]
+    missing_clean <- missing_data[!is.na(missing_data)]
+    
+    if(length(available_clean) > 10 & length(missing_clean) > 10) {
+      if(var %in% c("SEX", "WITHDRAWALLST")) {
+        contingency <- table(
+          Group = c(rep("Available", length(available_clean)), 
+                   rep("Missing", length(missing_clean))),
+          Value = c(available_clean, missing_clean)
+        )
+        
+        if(min(contingency) >= 5) {
+          chi_test <- chisq.test(contingency)
+          effect_size <- sqrt(chi_test$statistic / sum(contingency))
+          
+          mechanism_results <- rbind(mechanism_results, data.frame(
+            Variable = var,
+            Available_Mean = mean(available_clean),
+            Missing_Mean = mean(missing_clean),
+            P_Value = chi_test$p.value,
+            Effect_Size = as.numeric(effect_size)
+          ))
+        }
+      } else {
+        t_test <- t.test(available_clean, missing_clean)
+        pooled_sd <- sqrt(((length(available_clean) - 1) * var(available_clean) + 
+                          (length(missing_clean) - 1) * var(missing_clean)) / 
+                         (length(available_clean) + length(missing_clean) - 2))
+        cohens_d <- abs(mean(available_clean) - mean(missing_clean)) / pooled_sd
+        
+        mechanism_results <- rbind(mechanism_results, data.frame(
+          Variable = var,
+          Available_Mean = round(mean(available_clean), 2),
+          Missing_Mean = round(mean(missing_clean), 2),
+          P_Value = t_test$p.value,
+          Effect_Size = round(cohens_d, 3)
+        ))
+      }
+    }
+  }
+}
+
+if (nrow(mechanism_results) > 0) {
+  mechanism_results <- mechanism_results %>%
+    mutate(
+      Significance = case_when(
+        P_Value < 0.001 ~ "***",
+        P_Value < 0.01 ~ "**", 
+        P_Value < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      MNAR_Evidence = case_when(
+        Effect_Size < 0.2 ~ "Weak",
+        Effect_Size < 0.5 ~ "Moderate",
+        Effect_Size < 0.8 ~ "Strong", 
+        TRUE ~ "Very Strong"
+      )
+    )
+  
+  mnar_evidence <- sum(mechanism_results$P_Value < 0.05, na.rm = TRUE)
+} else {
+  mnar_evidence <- 0
+}
+
+total_tests <- nrow(mechanism_results)
+
+kable(missing_summary %>% head(20), caption = "Missing Data Summary - Top 20 Variables")
+kable(vte_missing_summary, caption = "VTE Prophylaxis Missing Data")
+kable(mechanism_results, caption = "Missing Data Mechanism Assessment")
 ```
 
 ## Variable Distribution + Outliers
