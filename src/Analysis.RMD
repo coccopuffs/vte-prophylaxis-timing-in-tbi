@@ -81,8 +81,50 @@ start <- fread("df_clean.csv")
 
 We extracted all admission-day covariates that may confound the association between prophylaxis initiation time and outcomes including: GCS, ISS, age, documented hyper- or hypocoagulable disorders, etc... All-cause mortality serves as the primary endpoint because its exact occurrence can be aligned with the recorded time of VTE prophylaxis initiation. Secondary endpoints (pulmonary embolism, deep-vein thrombosis, and myocardial infarction) are also captured to characterize how event rates vary across the initiation timeline.
 
-```{r, echo = FALSE}
-df <- start
+```{r data-prep, echo = FALSE}
+df <- start %>% 
+  # recode 2 → 0 for binary variables
+  mutate(across(
+    c(SEX, WITHDRAWALLST, TBIMIDLINESHIFT,
+      RESPIRATORYASSISTANCE, SUPPLEMENTALOXYGEN,
+      INTERFACILITYTRANSFER, PREHOSPITALCARDIACARREST, DEATHINED, BLOODMEASURE),
+    ~ ifelse(.x == 2, 0, .x)
+  )) %>% 
+  # apply cohort filters
+  filter(
+    SEX != 3,
+    TBIMIDLINESHIFT != 3,
+    VTEPROPHYLAXISTYPE %in% c("LWMH", "Unfractionated Heparin"),
+    VTEPROPHYLAXISHRS < 168
+  ) %>% 
+  
+  # set reference level for prophylaxis type
+  mutate(
+    VTEPROPHYLAXISTYPE = relevel(factor(VTEPROPHYLAXISTYPE),
+                                 ref = "Unfractionated Heparin")
+  ) %>%
+
+  mutate(
+    BLOOD4ML = case_when(
+      BLOODMEASURE == 1              ~ BLOOD4HOURS * BLOODCONVERSION,  # entered as units
+      BLOODMEASURE == 0              ~ BLOOD4HOURS,                    # already mL
+      is.na(BLOODMEASURE)            ~ BLOOD4HOURS * 300,              # assume 300 mL per unit
+      TRUE                           ~ NA_real_                        # fall-back, should be rare
+    )
+  ) %>% 
+  filter(BLOOD4ML <= 12500)
+
+cols_to_zero <- c(
+  "TOTALVENTDAYS", "TOTALICULOS",
+  "HE_UnplannedIntubation", "HE_Stroke.CVA", "HE_SevereSepsis",
+  "HE_DVT", "HE_UnplannedAdmissiontoICU", "HE_UnplannedVisittoOR",
+  "Hx_Pregnancy", "BLOOD4ML"
+)
+
+df <- df %>% mutate(across(everything(), ~ suppressWarnings(as.numeric(.x))))
+
+df <- df %>% 
+  mutate(across(all_of(cols_to_zero), ~ replace_na(.x, 0)))
 ```
 
 ## Missingness Analysis
