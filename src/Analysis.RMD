@@ -568,9 +568,110 @@ if (issues_found > 0) {
 ## Colinearty check
 Can you run these tests again
 
-```{r}
+```{r correlation-analysis}
+library(corrplot)
 
-```
+df_for_correlation <- if(exists("df_clean")) df_clean else df
+
+numeric_vars <- df_for_correlation %>%
+  select_if(is.numeric) %>%
+  names()
+
+correlation_data <- df_for_correlation[, numeric_vars, with = FALSE]
+correlation_matrix <- cor(correlation_data, use = "pairwise.complete.obs", method = "spearman")
+
+high_correlations <- data.frame(
+  var1 = character(),
+  var2 = character(),
+  correlation = numeric(),
+  abs_correlation = numeric(),
+  stringsAsFactors = FALSE
+)
+correlation_pairs <- 0
+
+for (i in 1:(length(numeric_vars)-1)) {
+  for (j in (i+1):length(numeric_vars)) {
+    var1 <- numeric_vars[i]
+    var2 <- numeric_vars[j]
+    corr_val <- correlation_matrix[i, j]
+    
+    if (!is.na(corr_val) && abs(corr_val) > 0.8) {
+      correlation_pairs <- correlation_pairs + 1
+      high_correlations[correlation_pairs, ] <- data.frame(
+        var1 = var1,
+        var2 = var2,
+        correlation = round(corr_val, 3),
+        abs_correlation = round(abs(corr_val), 3)
+      )
+    }
+  }
+}
+
+if (correlation_pairs > 0) {
+  high_correlations <- high_correlations %>%
+    arrange(desc(abs_correlation))
+  
+  variables_to_exclude <- character()
+  
+  for (i in 1:nrow(high_correlations)) {
+    var1 <- high_correlations$var1[i]
+    var2 <- high_correlations$var2[i]
+    
+    if (var1 %in% variables_to_exclude || var2 %in% variables_to_exclude) {
+      next
+    }
+    
+    if (var1 == "FINALDISCHARGEHRS" && var2 == "HOSPITALDISCHARGEHRS") {
+      variables_to_exclude <- c(variables_to_exclude, "HOSPITALDISCHARGEHRS")
+    } else if (var1 == "BLOOD4ML" && grepl("BLOOD4HOURS", var2)) {
+      variables_to_exclude <- c(variables_to_exclude, var2)
+    } else {
+      missing1 <- sum(is.na(df_for_correlation[[var1]]))
+      missing2 <- sum(is.na(df_for_correlation[[var2]]))
+      
+      if (missing1 <= missing2) {
+        variables_to_exclude <- c(variables_to_exclude, var2)
+      } else {
+        variables_to_exclude <- c(variables_to_exclude, var1)
+      }
+    }
+  }
+  
+  final_variables <- setdiff(numeric_vars, variables_to_exclude)
+} else {
+  final_variables <- numeric_vars
+  variables_to_exclude <- character()
+}
+
+if (length(final_variables) > 1 && length(final_variables) <= 20) {
+  final_corr_matrix <- cor(df_for_correlation[, final_variables, with = FALSE], 
+                          use = "pairwise.complete.obs", method = "spearman")
+  
+  corrplot(final_corr_matrix, 
+           method = "color",
+           type = "upper",
+           order = "hclust",
+           tl.cex = 0.8,
+           tl.col = "black",
+           tl.srt = 45)
+}
+
+if (length(variables_to_exclude) > 0) {
+  non_numeric_vars <- names(df_for_correlation)[!names(df_for_correlation) %in% numeric_vars]
+  final_all_variables <- c(non_numeric_vars, final_variables)
+  
+  df_selected <- df_for_correlation %>%
+    select(all_of(final_all_variables))
+} else {
+  df_selected <- df_for_correlation
+}
+
+if (correlation_pairs > 0) {
+  kable(high_correlations, caption = "High Correlation Pairs (|r| > 0.8)")
+}
+
+# Save dataset before multiple imputation
+save(df_selected, file = "data/pre_imputation_dataset.RData")
 
 ## Outcome + Event Rate Checks
 Can you check the following things
